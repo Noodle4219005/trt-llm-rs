@@ -1,0 +1,458 @@
+//! Decode admission control.
+//!
+//! Decode sets the ceiling on `req/s`, and the ceiling is
+//! `concurrency / (osl * itl)`. There are only two ways to raise it: run more
+//! sequences at once, or spend more of the ITL budget per token. The measured
+//! reference point does neither - 53 sequences at a mean ITL of 17.23 ms leaves
+//! 14 % of a 20 ms budget unspent, which is 14 % of the score left on the table.
+//!
+//! Taking that headroom needs care, because the SLO is a *mean over the life of
+//! one request*. Two consequences drive the design:
+//!
+//! * A request that has already emitted 150 tokens at 15 ms can absorb a much
+//!   worse tail than one that has emitted 5. [`RunningSeq::tolerable_itl_ms`]
+//!   makes that explicit, so the pool can run hot while its sequences are young
+//!   and back off before anyone's *average* is spoiled.
+//! * The ITL-versus-concurrency curve for this model is not known. One
+//!   saturated point and one unsaturated sweep do not determine it, and fitting
+//!   a line through them predicts concurrencies nobody has observed. So the cap
+//!   is not read off a model at all: [`ItlController`] moves it by AIMD against
+//!   measured step latency, the same way congestion control handles a link
+//!   whose capacity it cannot see.
+
+use std::collections::HashMap;
+
+use trtllm_core::{Millis, RequestId};
+
+/// A sequence currently decoding.
+#[derive(Clone, Copy, Debug)]
+pub struct RunningSeq {
+    pub id: RequestId,
+    pub first_token_ms: Millis,
+    pub last_token_ms: Millis,
+    pub tokens_emitted: u32,
+    pub requested_tokens: u32,
+}
+
+impl RunningSeq {
+    pub fn new(id: RequestId, first_token_ms: Millis, requested_tokens: u32) -> Self {
+        Self {
+            id,
+            first_token_ms,
+            last_token_ms: first_token_ms,
+            tokens_emitted: 1,
+            requested_tokens,
+        }
+    }
+
+    pub fn remaining_tokens(&self) -> u32 {
+        self.requested_tokens.saturating_sub(self.tokens_emitted)
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.tokens_emitted >= self.requested_tokens
+    }
+
+    /// Milliseconds already spent between the first and the most recent token.
+    pub fn elapsed_ms(&self) -> f64 {
+        self.last_token_ms - self.first_token_ms
+    }
+
+    /// Mean ITL over the tokens emitted so far.
+    pub fn mean_itl_so_far_ms(&self) -> f64 {
+        if self.tokens_emitted <= 1 {
+            0.0
+        } else {
+            self.elapsed_ms() / f64::from(self.tokens_emitted - 1)
+        }
+    }
+
+    /// The largest per-token latency this sequence can sustain for all of its
+    /// *remaining* tokens and still finish with a mean ITL inside `budget_ms`.
+    ///
+    /// `(budget * gaps_total - elapsed) / gaps_remaining`, where
+    /// `gaps_total = requested - 1`. Returns `f64::INFINITY` when there is
+    /// nothing left to emit, and a negative number when the request is already
+    /// unsalvageable - which is useful information, not an error.
+    pub fn tolerable_itl_ms(&self, budget_ms: f64) -> f64 {
+        let remaining = self.remaining_tokens();
+        if remaining == 0 {
+            return f64::INFINITY;
+        }
+        let gaps_total = f64::from(self.requested_tokens.saturating_sub(1));
+        (budget_ms * gaps_total - self.elapsed_ms()) / f64::from(remaining)
+    }
+}
+
+/// AIMD controller over the decode concurrency cap.
+#[derive(Clone, Debug)]
+pub struct ItlController {
+    target_ms: f64,
+    ewma_ms: f64,
+    alpha: f64,
+    cap: f64,
+    min_cap: f64,
+    max_cap: f64,
+    increase_step: f64,
+    decrease_factor: f64,
+    low_water: f64,
+    high_water: f64,
+    /// Fraction of the cap the batch must actually reach before the cap is
+    /// allowed to grow.
+    utilisation_gate: f64,
+    samples: u64,
+}
+
+impl ItlController {
+    pub fn new(target_ms: f64, initial_cap: f64, min_cap: f64, max_cap: f64) -> Self {
+        Self {
+            target_ms,
+            ewma_ms: 0.0,
+            alpha: 0.1,
+            cap: initial_cap.clamp(min_cap, max_cap),
+            min_cap,
+            max_cap,
+            increase_step: 1.0,
+            decrease_factor: 0.9,
+            low_water: 0.90,
+            high_water: 0.98,
+            utilisation_gate: 0.9,
+            samples: 0,
+        }
+    }
+
+    pub fn target_ms(&self) -> f64 {
+        self.target_ms
+    }
+
+    pub fn cap(&self) -> f64 {
+        self.cap
+    }
+
+    pub fn observed_itl_ms(&self) -> f64 {
+        self.ewma_ms
+    }
+
+    pub fn samples(&self) -> u64 {
+        self.samples
+    }
+
+    /// Feed one measured decode step. `step_ms` is the wall time of a forward
+    /// pass, which is the inter-token latency every sequence in the batch sees,
+    /// and `concurrency` is how many sequences were in it.
+    ///
+    /// `concurrency` is not decoration. A cap that is not the binding
+    /// constraint must not grow: under a closed-loop client the batch size is
+    /// set by arrivals, not by the cap, so a cap that keeps integrating upward
+    /// while load is light reaches its ceiling and then needs a long run of
+    /// multiplicative decreases to come back when load finally arrives. Same
+    /// reason TCP does not open the congestion window while it is
+    /// application-limited. The first end-to-end simulation caught exactly
+    /// this: the cap finished at its 4096 ceiling with a real batch of 58.
+    pub fn observe(&mut self, step_ms: f64, concurrency: usize) {
+        self.samples += 1;
+        self.ewma_ms = if self.samples == 1 {
+            step_ms
+        } else {
+            (1.0 - self.alpha) * self.ewma_ms + self.alpha * step_ms
+        };
+
+        // Do not steer on a handful of samples; a cold batch is not the steady
+        // state and reacting to it oscillates.
+        if self.samples < 8 {
+            return;
+        }
+        if self.ewma_ms > self.target_ms * self.high_water {
+            self.cap = (self.cap * self.decrease_factor).max(self.min_cap);
+        } else if self.ewma_ms < self.target_ms * self.low_water
+            && concurrency as f64 >= self.cap * self.utilisation_gate
+        {
+            self.cap = (self.cap + self.increase_step).min(self.max_cap);
+        }
+    }
+
+    /// Force the cap down, e.g. because an in-flight request is about to blow
+    /// its own average.
+    pub fn back_off(&mut self) {
+        self.cap = (self.cap * self.decrease_factor).max(self.min_cap);
+    }
+}
+
+/// Why the scheduler did or did not take a new sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmitDecision {
+    Admit,
+    /// The concurrency cap is already reached.
+    AtCap,
+    /// Admitting would push an in-flight request past its own ITL average.
+    WouldSpoilRunning,
+    /// The worker has no KV headroom.
+    NoKvHeadroom,
+}
+
+impl AdmitDecision {
+    pub fn is_admit(self) -> bool {
+        matches!(self, AdmitDecision::Admit)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AdmitDecision::Admit => "admit",
+            AdmitDecision::AtCap => "at-cap",
+            AdmitDecision::WouldSpoilRunning => "would-spoil-running",
+            AdmitDecision::NoKvHeadroom => "no-kv-headroom",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct DecodeScheduler {
+    running: HashMap<RequestId, RunningSeq>,
+    controller: ItlController,
+    itl_budget_ms: f64,
+    /// How much of the measured step latency an in-flight request must still be
+    /// able to absorb before another sequence is let in. 1.0 is break-even;
+    /// above 1.0 keeps a margin against the step getting slower.
+    risk_margin: f64,
+    admitted: u64,
+    refused: u64,
+}
+
+impl DecodeScheduler {
+    pub fn new(itl_budget_ms: f64, controller: ItlController) -> Self {
+        Self {
+            running: HashMap::new(),
+            controller,
+            itl_budget_ms,
+            risk_margin: 1.05,
+            admitted: 0,
+            refused: 0,
+        }
+    }
+
+    pub fn controller(&self) -> &ItlController {
+        &self.controller
+    }
+
+    pub fn concurrency(&self) -> usize {
+        self.running.len()
+    }
+
+    pub fn admitted(&self) -> u64 {
+        self.admitted
+    }
+
+    pub fn refused(&self) -> u64 {
+        self.refused
+    }
+
+    pub fn running(&self) -> impl Iterator<Item = &RunningSeq> {
+        self.running.values()
+    }
+
+    /// The tightest ITL tolerance among the sequences in flight. This is the
+    /// number that says how much room the pool actually has, and it is not the
+    /// same as "budget minus current ITL": a request that has been slow so far
+    /// is already spending its future.
+    pub fn tightest_tolerance_ms(&self) -> f64 {
+        self.running
+            .values()
+            .map(|s| s.tolerable_itl_ms(self.itl_budget_ms))
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// Can one more sequence start decoding right now?
+    pub fn can_admit(&self, kv_headroom: bool) -> AdmitDecision {
+        if !kv_headroom {
+            return AdmitDecision::NoKvHeadroom;
+        }
+        if (self.running.len() as f64) >= self.controller.cap() {
+            return AdmitDecision::AtCap;
+        }
+        // Only meaningful once the controller has an opinion about step latency.
+        if self.controller.samples() >= 8 {
+            let tightest = self.tightest_tolerance_ms();
+            if tightest.is_finite()
+                && tightest < self.controller.observed_itl_ms() * self.risk_margin
+            {
+                return AdmitDecision::WouldSpoilRunning;
+            }
+        }
+        AdmitDecision::Admit
+    }
+
+    /// Record a decision so the refusal reasons show up in metrics whether or
+    /// not the caller went ahead.
+    pub fn note(&mut self, decision: AdmitDecision) {
+        if decision.is_admit() {
+            self.admitted += 1;
+        } else {
+            self.refused += 1;
+            if decision == AdmitDecision::WouldSpoilRunning {
+                self.controller.back_off();
+            }
+        }
+    }
+
+    pub fn admit(&mut self, seq: RunningSeq) {
+        self.running.insert(seq.id, seq);
+    }
+
+    /// Advance every running sequence by one token. Returns the requests that
+    /// just finished.
+    pub fn on_step(&mut self, now: Millis, step_ms: f64) -> Vec<RunningSeq> {
+        self.controller.observe(step_ms, self.running.len());
+        let mut done = Vec::new();
+        for seq in self.running.values_mut() {
+            seq.tokens_emitted += 1;
+            seq.last_token_ms = now;
+            if seq.is_done() {
+                done.push(*seq);
+            }
+        }
+        for s in &done {
+            self.running.remove(&s.id);
+        }
+        done
+    }
+
+    pub fn remove(&mut self, id: RequestId) -> Option<RunningSeq> {
+        self.running.remove(&id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seq_at(emitted: u32, elapsed: f64, requested: u32) -> RunningSeq {
+        RunningSeq {
+            id: RequestId(0),
+            first_token_ms: 0.0,
+            last_token_ms: elapsed,
+            tokens_emitted: emitted,
+            requested_tokens: requested,
+        }
+    }
+
+    /// A young request can absorb almost the whole budget; an old slow one
+    /// cannot. Treating them the same is what makes a naive batch-size cap
+    /// either too timid or too late.
+    #[test]
+    fn tolerance_depends_on_how_much_of_the_average_is_already_spent() {
+        // Fresh: one token out, 199 gaps to go, 20 ms budget.
+        let fresh = seq_at(1, 0.0, 200);
+        assert!((fresh.tolerable_itl_ms(20.0) - 20.0).abs() < 0.01);
+
+        // Ran cheap for 150 tokens at 15 ms: it has banked a lot of slack.
+        let banked = seq_at(150, 149.0 * 15.0, 200);
+        assert!(
+            banked.tolerable_itl_ms(20.0) > 33.0,
+            "{}",
+            banked.tolerable_itl_ms(20.0)
+        );
+
+        // Ran expensive for 150 tokens at 21 ms: already over, no room left.
+        let spent = seq_at(150, 149.0 * 21.0, 200);
+        assert!(
+            spent.tolerable_itl_ms(20.0) < 18.0,
+            "{}",
+            spent.tolerable_itl_ms(20.0)
+        );
+    }
+
+    #[test]
+    fn a_finished_sequence_tolerates_anything() {
+        assert!(seq_at(200, 4000.0, 200)
+            .tolerable_itl_ms(20.0)
+            .is_infinite());
+    }
+
+    #[test]
+    fn controller_raises_the_cap_while_latency_is_under_budget() {
+        let mut c = ItlController::new(20.0, 40.0, 8.0, 256.0);
+        for _ in 0..40 {
+            let at_cap = c.cap() as usize;
+            c.observe(15.0, at_cap);
+        }
+        assert!(
+            c.cap() > 40.0,
+            "cap should climb into the unused budget: {}",
+            c.cap()
+        );
+        assert!(c.cap() <= 256.0);
+    }
+
+    /// The cap must stay put when the batch is nowhere near it. Otherwise it
+    /// integrates to its ceiling under light load and is useless as a brake the
+    /// moment load arrives.
+    #[test]
+    fn an_unbinding_cap_does_not_grow() {
+        let mut c = ItlController::new(20.0, 64.0, 8.0, 4096.0);
+        for _ in 0..200 {
+            c.observe(12.0, 4);
+        }
+        assert!((c.cap() - 64.0).abs() < 1e-9, "cap drifted to {}", c.cap());
+    }
+
+    #[test]
+    fn controller_backs_off_when_latency_crosses_the_target() {
+        let mut c = ItlController::new(20.0, 64.0, 8.0, 256.0);
+        for _ in 0..40 {
+            let at_cap = c.cap() as usize;
+            c.observe(15.0, at_cap);
+        }
+        let hot = c.cap();
+        for _ in 0..60 {
+            c.observe(26.0, 64);
+        }
+        assert!(
+            c.cap() < hot,
+            "cap must fall once ITL exceeds target: {hot} -> {}",
+            c.cap()
+        );
+        assert!(c.cap() >= 8.0, "cap must not collapse below the floor");
+    }
+
+    #[test]
+    fn admission_stops_at_the_cap() {
+        let mut s = DecodeScheduler::new(20.0, ItlController::new(20.0, 2.0, 1.0, 8.0));
+        s.admit(RunningSeq::new(RequestId(1), 0.0, 200));
+        s.admit(RunningSeq::new(RequestId(2), 0.0, 200));
+        assert_eq!(s.can_admit(true), AdmitDecision::AtCap);
+    }
+
+    #[test]
+    fn no_kv_headroom_beats_every_other_reason() {
+        let s = DecodeScheduler::new(20.0, ItlController::new(20.0, 64.0, 1.0, 256.0));
+        assert_eq!(s.can_admit(false), AdmitDecision::NoKvHeadroom);
+    }
+
+    #[test]
+    fn admission_is_refused_when_an_inflight_request_has_no_room_left() {
+        let mut s = DecodeScheduler::new(20.0, ItlController::new(20.0, 64.0, 1.0, 256.0));
+        // One request that has already burned its average.
+        s.admit(RunningSeq {
+            id: RequestId(7),
+            first_token_ms: 0.0,
+            last_token_ms: 149.0 * 22.0,
+            tokens_emitted: 150,
+            requested_tokens: 200,
+        });
+        for _ in 0..10 {
+            s.controller.observe(19.0, 1);
+        }
+        assert_eq!(s.can_admit(true), AdmitDecision::WouldSpoilRunning);
+    }
+
+    #[test]
+    fn stepping_retires_sequences_that_reached_their_token_count() {
+        let mut s = DecodeScheduler::new(20.0, ItlController::new(20.0, 64.0, 1.0, 256.0));
+        s.admit(RunningSeq::new(RequestId(1), 0.0, 3));
+        assert!(s.on_step(17.0, 17.0).is_empty());
+        let done = s.on_step(34.0, 17.0);
+        assert_eq!(done.len(), 1);
+        assert_eq!(s.concurrency(), 0);
+        assert_eq!(done[0].tokens_emitted, 3);
+    }
+}

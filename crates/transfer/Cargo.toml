@@ -1,0 +1,19 @@
+[package]
+name = "trtllm-transfer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "KV cache transfer between prefill and decode workers"
+
+[features]
+default = []
+# Binds NIXL. Requires libnixl and UCX; see docs/kv-transfer.md.
+nixl = []
+
+[dependencies]
+trtllm-core.workspace = true
+trtllm-kvcache.workspace = true
+async-trait.workspace = true
+tokio.workspace = true

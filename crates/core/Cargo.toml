@@ -1,0 +1,14 @@
+[package]
+name = "trtllm-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared types, SLO / goodput accounting and the calibrated capacity model for trt-llm-rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+toml.workspace = true

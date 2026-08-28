@@ -1,0 +1,13 @@
+[package]
+name = "trtllm-router"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Prefill/decode worker registry and routing policy"
+
+[dependencies]
+trtllm-core.workspace = true
+trtllm-kvcache.workspace = true
+serde.workspace = true

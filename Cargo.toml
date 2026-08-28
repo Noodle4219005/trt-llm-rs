@@ -1,0 +1,62 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/kvcache",
+    "crates/sched",
+    "crates/engine",
+    "crates/transfer",
+    "crates/router",
+    "crates/frontend",
+    "crates/worker",
+    "crates/sim",
+    "crates/tuner",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/REPLACE-ME/trt-llm-rs"
+
+[workspace.dependencies]
+trtllm-core      = { path = "crates/core" }
+trtllm-kvcache   = { path = "crates/kvcache" }
+trtllm-sched     = { path = "crates/sched" }
+trtllm-engine    = { path = "crates/engine" }
+trtllm-transfer  = { path = "crates/transfer" }
+trtllm-router    = { path = "crates/router" }
+trtllm-frontend  = { path = "crates/frontend" }
+trtllm-worker    = { path = "crates/worker" }
+trtllm-sim       = { path = "crates/sim" }
+trtllm-tuner     = { path = "crates/tuner" }
+
+anyhow      = "1"
+thiserror   = "1"
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+toml        = "0.8"
+tokio       = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
+tokio-stream = "0.1"
+async-trait = "0.1"
+axum        = "0.7"
+futures     = "0.3"
+tracing     = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+clap        = { version = "4", features = ["derive"] }
+parking_lot = "0.12"
+rand        = "0.8"
+reqwest     = { version = "0.12", default-features = false, features = ["json", "stream"] }
+uuid        = { version = "1", features = ["v4", "serde"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+debug = 1
+
+[profile.bench]
+inherits = "release"

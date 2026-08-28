@@ -1,0 +1,13 @@
+[package]
+name = "trtllm-kvcache"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Paged KV block pool, prefix cache and router-side radix index"
+
+[dependencies]
+trtllm-core.workspace = true
+serde.workspace = true
+tracing.workspace = true

@@ -1,0 +1,81 @@
+# 4P1D on 16xH200: four TP2 prefill workers feeding one TP8 decode worker.
+#
+# Why this shape. Profiling a TP4 prefill worker on this model found 25 % of all
+# GPU kernel time inside `ncclDevKernel_AllReduce_Sum_bf16_RING_LL`, with the
+# kernel count fixed at 190 (94 layers x 2) and the time scaling linearly with
+# token count - bandwidth bound. Per-GPU compute is invariant in the tensor
+# parallel degree; per-rank ring all-reduce traffic scales as (t-1)/t. Halving
+# the prefill TP therefore buys about 9 % more prefill tokens per GPU for free,
+# and the decode side keeps the wide TP8 worker it needs for KV capacity.
+
+[model]
+name = "Qwen/Qwen3-235B-A22B-Instruct-2507"
+tokenizer = "Qwen/Qwen3-235B-A22B-Instruct-2507"
+dtype = "fp8"
+kv_dtype = "fp8"
+num_layers = 94
+hidden_size = 4096
+num_kv_heads = 4
+head_dim = 128
+
+[workload]
+isl = 4000
+osl = 200
+concurrency = 80
+warmup_s = 60.0
+benchmark_s = 120.0
+grace_s = 30.0
+seed = 2026
+# The scored run busts the prefix cache. Any result produced with this false is
+# measuring the cache, not the model.
+cache_bust = true
+
+[topology]
+total_gpus = 16
+prefill_workers = 4
+prefill_tp = 2
+decode_workers = 1
+decode_tp = 8
+
+[scheduler]
+# 16384 lets 4-5 sequences share a prefill forward pass, worth ~11.6 % over the
+# 4096 setting that forces one sequence per batch.
+chunked_prefill_tokens = 16384
+max_prefill_seqs = 8
+max_decode_seqs = 4096
+itl_safety = 1.0
+prefill_policy = "moore-hodgson"
+demote_hopeless = true
+tick_ms = 1.0
+
+[kv]
+block_size = 128
+num_blocks = 8192
+enable_prefix_cache = false
+admission_watermark = 0.05
+
+[slo]
+ttft_ms = 3000.0
+itl_ms = 20.0
+good_frac_target = 0.90
+
+# Measured on this cluster. Replace these before trusting any planning number
+# on different hardware or a different backend.
+[calibration]
+assumed_good_frac = 0.93
+
+[calibration.prefill]
+# SGLang ep1-2p2d-gwab-302350, cold cache (0.0 % radix hit), TP4, chunk 16384.
+tok_s_per_gpu = 7796.0
+tp_ref = 4
+tp_allreduce_frac = 0.25
+duty_cycle = 0.91
+
+[calibration.decode]
+# Same run: 53 sustained sequences over 8 GPUs at mean ITL 17.23 ms.
+# itl_slope_ms is NOT identified by that single point - see
+# crates/engine/src/cost.rs. The runtime steers on measured ITL instead.
+concurrency_per_gpu = 6.625
+itl_ms_at_ref = 17.23
+itl_slope_ms = 0.10
+max_extrapolation = 1.0

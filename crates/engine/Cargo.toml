@@ -1,0 +1,20 @@
+[package]
+name = "trtllm-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Execution backend abstraction: analytic mock engine plus the TensorRT-LLM FFI seam"
+
+[features]
+default = []
+# Compiles the TensorRT-LLM C++ Executor binding. Requires a TensorRT-LLM
+# install and a CUDA toolchain; see docs/trtllm-ffi.md. Never enabled in CI.
+trtllm = []
+
+[dependencies]
+trtllm-core.workspace = true
+trtllm-kvcache.workspace = true
+async-trait.workspace = true
+tokio.workspace = true

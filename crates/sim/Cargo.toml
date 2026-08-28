@@ -1,0 +1,16 @@
+[package]
+name = "trtllm-sim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Deterministic discrete-event simulation of the whole deployment"
+
+[dependencies]
+trtllm-core.workspace = true
+trtllm-engine.workspace = true
+trtllm-kvcache.workspace = true
+trtllm-router.workspace = true
+trtllm-sched.workspace = true
+serde.workspace = true

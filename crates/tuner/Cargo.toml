@@ -1,0 +1,14 @@
+[package]
+name = "trtllm-tuner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AIConfigurator-driven parameter search, scored under this project's own goodput metric"
+
+[dependencies]
+trtllm-core.workspace = true
+trtllm-sim.workspace = true
+serde.workspace = true
+serde_json.workspace = true

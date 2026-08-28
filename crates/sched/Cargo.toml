@@ -1,0 +1,11 @@
+[package]
+name = "trtllm-sched"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Goodput-aware prefill ordering and decode admission control"
+
+[dependencies]
+trtllm-core.workspace = true
