@@ -34,7 +34,13 @@ impl CrossCheck {
         );
         let gpus = f64::from(t.total_gpus.max(1));
         let ours = split.sustainable_req_s * f64::from(cfg.workload.osl) / gpus;
-        let theirs = candidate.predicted_tokens_s_per_gpu;
+        // Prefer AIConfigurator's own `seq/s`: it is the same quantity as our
+        // sustainable request rate, so comparing them needs no conversion and
+        // no assumption about which OSL either side divided by.
+        let theirs = candidate
+            .predicted_seq_s
+            .map(|s| s * f64::from(cfg.workload.osl) / gpus)
+            .or(candidate.predicted_tokens_s_per_gpu);
         let ratio = theirs.map(|x| x / ours.max(f64::MIN_POSITIVE));
 
         let (verdict, note) = match ratio {
@@ -93,8 +99,14 @@ impl TuningPlan {
         let mut plan = Self::default();
         for c in candidates {
             let Some(cfg) = c.apply_to(base) else {
-                plan.skipped
-                    .push(format!("{}: no parallelism layout in the row", c.source));
+                plan.skipped.push(match c.mode {
+                    crate::aic::DeploymentMode::Agg => format!(
+                        "{}: aggregated layout, {} GPUs/worker - not a P/D split, listed for comparison only",
+                        c.label(),
+                        c.prefill_gpus_per_worker
+                    ),
+                    _ => format!("{}: unreadable topology in {}", c.label(), c.source),
+                });
                 continue;
             };
             if let Err(e) = cfg.validate() {
@@ -165,21 +177,23 @@ mod tests {
         c
     }
 
-    #[test]
-    fn candidates_are_ranked_by_simulated_goodput_not_by_aic_order() {
-        let t = Table::parse(
-            "(p)parallel,(p)replicas,(d)parallel,(d)replicas,total gpus,tokens/s/gpu\n\
-             tp8pp1,1,tp8pp1,1,16,100.0\n\
-             tp2pp1,4,tp8pp1,1,16,400.0\n",
-        )
-        .expect("parse");
-        let cands = candidates_from_table(&t, DeploymentMode::Disagg, "test");
-        let plan = TuningPlan::evaluate(&cands, &short_base());
-        assert_eq!(plan.rows.len(), 2, "{:?}", plan.skipped);
+    /// Two rows in aiconfigurator's real disagg schema: 4x2 GPU prefill + 1x8
+    /// GPU decode, and 2x4 GPU prefill + 1x8 GPU decode. The first row claims a
+    /// far lower tokens/s/gpu than the second, so a ranking that follows the
+    /// CSV's own numbers rather than our simulation would order them the other
+    /// way round.
+    fn two_rows() -> Vec<crate::aic::AicCandidate> {
+        let csv = "(p)workers,(p)tp,(p)pp,(p)dp,(p)moe_ep,(d)workers,(d)tp,(d)pp,(d)dp,(d)moe_ep,num_total_gpus,seq/s,tokens/s/gpu\n\
+4,1,1,2,2,1,8,1,1,8,16,14.375,179.685\n\
+2,4,1,1,4,1,8,1,1,8,16,9.0,112.5\n";
+        let t = Table::parse(csv).expect("parse");
+        candidates_from_table(&t, DeploymentMode::Disagg, "test")
+    }
 
-        // The ranking must follow the *simulated* score, not the order
-        // AIConfigurator happened to emit and not the tokens/s/gpu column it
-        // reported - here the second row claims 4x the throughput of the first.
+    #[test]
+    fn candidates_are_ranked_by_simulated_goodput_not_by_the_csv_column() {
+        let plan = TuningPlan::evaluate(&two_rows(), &short_base());
+        assert_eq!(plan.rows.len(), 2, "{:?}", plan.skipped);
         for w in plan.rows.windows(2) {
             assert!(
                 w[0].sim.goodput.goodput_req_s >= w[1].sim.goodput.goodput_req_s,
@@ -188,51 +202,35 @@ mod tests {
             );
         }
         assert!(plan.table().contains("goodput"));
-
-        // Deliberately NOT asserted: which of the two shapes wins. An earlier
-        // version of this test asserted 4x TP2, on the reasoning that narrower
-        // prefill workers carry less ring all-reduce per rank. The simulation
-        // disagreed, and the disagreement turned out to be a real mechanism
-        // rather than a bug - see `both_prefill_shapes_are_evaluated` below.
-        // Pinning the expected winner would have hidden it.
+        // Deliberately NOT asserted: which shape wins. An earlier version
+        // pinned the expected winner and the simulation disagreed for a real
+        // reason - see `both_prefill_shapes_are_evaluated`.
     }
 
-    /// Both prefill shapes must be scored, and the reported ranking must be
-    /// self-consistent with the numbers behind it.
+    /// Both shapes must be scored, on the topology the CSV actually describes.
     ///
-    /// The winner depends on the *window*, which is why this test does not
-    /// name one. On the full 60 s warmup / 120 s benchmark configuration the
-    /// simulator ranks 4x TP2 (16.67) above 2x TP4 (15.63) above 1x TP8
-    /// (15.05) - the all-reduce argument holds in steady state. On the short
-    /// window this test uses, one wide worker can come out ahead instead,
-    /// because a short window is dominated by the cold-start transient: every
-    /// client arrives at t = 0 at once, and one pooled queue drains a burst
-    /// better than four separate ones however good the routing is.
-    ///
-    /// Both are real; they answer different questions. The lesson is the one
-    /// this project already paid for on hardware - **check what the window
-    /// contains before reading the metric**. `SimReport::caveats()` flags a
-    /// window with fewer than 100 scored requests for the same reason.
+    /// The winner depends on the *window*. On the full 60 s warmup / 120 s
+    /// benchmark configuration the simulator ranks 4x2 GPU prefill above
+    /// 2x4 GPU above 1x8 GPU, which is the all-reduce argument holding in
+    /// steady state. On the short window used here, one wide worker can come
+    /// out ahead instead, because a short window is dominated by the
+    /// cold-start transient: every client arrives at t = 0 and one pooled
+    /// queue drains a burst better than four separate ones however good the
+    /// routing is. Both are real; they answer different questions.
     #[test]
     fn both_prefill_shapes_are_evaluated() {
-        let t = Table::parse(
-            "(p)parallel,(p)replicas,(d)parallel,(d)replicas,total gpus\n\
-             tp8pp1,1,tp8pp1,1,16\n\
-             tp2pp1,4,tp8pp1,1,16\n",
-        )
-        .expect("parse");
-        let cands = candidates_from_table(&t, DeploymentMode::Disagg, "test");
-        let plan = TuningPlan::evaluate(&cands, &short_base());
-        let tps: Vec<u32> = plan
+        let plan = TuningPlan::evaluate(&two_rows(), &short_base());
+        let shapes: Vec<u32> = plan
             .rows
             .iter()
             .map(|r| r.config.topology.prefill_tp)
             .collect();
         assert!(
-            tps.contains(&2) && tps.contains(&8),
-            "both shapes must be scored: {tps:?}"
+            shapes.contains(&2) && shapes.contains(&4),
+            "both shapes scored: {shapes:?}"
         );
         for r in &plan.rows {
+            assert_eq!(r.config.topology.total_gpus, 16);
             assert!(
                 r.sim.goodput.total_requests > 0,
                 "{} produced no scored requests",
@@ -243,23 +241,24 @@ mod tests {
 
     #[test]
     fn a_topology_that_does_not_fit_is_skipped_not_silently_resized() {
-        let t = Table::parse(
-            "(p)parallel,(p)replicas,(d)parallel,(d)replicas,total gpus\ntp8pp1,4,tp8pp1,1,16\n",
-        )
-        .expect("parse");
+        let csv = "(p)workers,(p)tp,(p)pp,(p)dp,(d)workers,(d)tp,(d)pp,(d)dp,num_total_gpus\n\
+4,8,1,1,1,8,1,1,16\n";
+        let t = Table::parse(csv).expect("parse");
         let cands = candidates_from_table(&t, DeploymentMode::Disagg, "test");
         let plan = TuningPlan::evaluate(&cands, &short_base());
-        assert!(plan.rows.is_empty());
+        assert!(
+            plan.rows.is_empty(),
+            "4x8 + 1x8 = 40 GPUs must not fit in 16"
+        );
         assert_eq!(plan.skipped.len(), 1);
     }
 
     #[test]
     fn a_wildly_optimistic_aic_number_is_flagged() {
-        let t = Table::parse(
-            "(p)parallel,(p)replicas,(d)parallel,(d)replicas,total gpus,tokens/s/gpu\n\
-             tp2pp1,4,tp8pp1,1,16,99999.0\n",
-        )
-        .expect("parse");
+        let csv =
+            "(p)workers,(p)tp,(p)pp,(p)dp,(d)workers,(d)tp,(d)pp,(d)dp,num_total_gpus,seq/s\n\
+4,1,1,2,1,8,1,1,16,9999.0\n";
+        let t = Table::parse(csv).expect("parse");
         let cands = candidates_from_table(&t, DeploymentMode::Disagg, "test");
         let plan = TuningPlan::evaluate(&cands, &short_base());
         assert_eq!(plan.rows[0].cross_check.verdict, "aic-optimistic");
