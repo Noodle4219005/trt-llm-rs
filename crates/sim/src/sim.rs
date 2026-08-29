@@ -375,7 +375,7 @@ impl Simulator {
         self.concurrency_samples.push(concurrency as f64);
         self.peak_concurrency = self.peak_concurrency.max(concurrency);
 
-        let done = self.decode[w].sched.on_step(t_done, step_ms);
+        let done = self.decode[w].sched.on_step_synthetic(t_done, step_ms);
         // Every attached sequence advanced one token.
         let ids: Vec<RequestId> = self.decode[w].sched.running().map(|s| s.id).collect();
         for id in ids {

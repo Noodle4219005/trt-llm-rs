@@ -153,7 +153,13 @@ impl DecodeWorker {
                     continue;
                 }
             };
-            let done = self.sched.lock().on_step(self.now_ms(), step.elapsed_ms);
+            let advanced: Vec<RequestId> = step.tokens.iter().map(|(id, _)| *id).collect();
+            let done = self.sched.lock().on_step(
+                self.now_ms(),
+                step.elapsed_ms,
+                &advanced,
+                &step.finished,
+            );
 
             for (id, token) in step.tokens {
                 if out.send(DecodeEvent::Token { id, token }).await.is_err() {

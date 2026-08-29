@@ -20,7 +20,7 @@
 //!   measured step latency, the same way congestion control handles a link
 //!   whose capacity it cannot see.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use trtllm_core::{Millis, RequestId};
 
@@ -216,6 +216,21 @@ pub struct DecodeScheduler {
     risk_margin: f64,
     admitted: u64,
     refused: u64,
+    /// Sequences the engine did not report as finished, even though our own
+    /// bookkeeping says they have emitted their full token budget. Counted,
+    /// never acted on: see [`DecodeScheduler::on_step`].
+    ///
+    /// Counted once per *sequence*, not once per step. A sequence in this
+    /// state stays running, so a per-step count would grow without bound for
+    /// as long as it lived and would say more about how long we watched than
+    /// about how often the two sides disagree.
+    pub finish_disagreements: u64,
+    /// Ids already counted in `finish_disagreements`, so each is counted once.
+    /// Bounded by concurrency: entries leave when the sequence is retired.
+    flagged: HashSet<RequestId>,
+    /// `finished` ids the engine reported for a request we were not tracking
+    /// as running (already removed, or never admitted).
+    pub unknown_finish_reports: u64,
 }
 
 impl DecodeScheduler {
@@ -227,6 +242,9 @@ impl DecodeScheduler {
             risk_margin: 1.05,
             admitted: 0,
             refused: 0,
+            finish_disagreements: 0,
+            flagged: HashSet::new(),
+            unknown_finish_reports: 0,
         }
     }
 
@@ -298,25 +316,90 @@ impl DecodeScheduler {
         self.running.insert(seq.id, seq);
     }
 
-    /// Advance every running sequence by one token. Returns the requests that
-    /// just finished.
-    pub fn on_step(&mut self, now: Millis, step_ms: f64) -> Vec<RunningSeq> {
+    /// Apply the engine's report of what happened during one decode step.
+    ///
+    /// The engine is the sole authority on which requests advanced and which
+    /// finished - this scheduler no longer infers either. That contract
+    /// ("one step = one token for every running sequence, and we can tell for
+    /// ourselves when a sequence is done") was refuted by job 312007: with
+    /// TensorRT-LLM's overlap scheduler on, the engine measured 3.19 ms ITL /
+    /// 64.88 req/s; forced off, 5.34 ms ITL / 42.47 req/s (+67.3% ITL, -34.5%
+    /// throughput), so overlap must stay on. With overlap on, `decode_step`
+    /// returns the *previous* step's tokens, and not every running sequence
+    /// is guaranteed to advance in a given step.
+    ///
+    /// `self.controller.observe` is deliberately unchanged: even though which
+    /// sequences a step belongs to is no longer knowable from `self.running`
+    /// alone, a pipelined step's wall time is still the inter-token latency
+    /// the AIMD controller needs to see.
+    pub fn on_step(
+        &mut self,
+        now: Millis,
+        step_ms: f64,
+        advanced: &[RequestId],
+        finished: &[RequestId],
+    ) -> Vec<RunningSeq> {
         self.controller.observe(step_ms, self.running.len());
-        let mut done = Vec::new();
-        for seq in self.running.values_mut() {
-            seq.tokens_emitted += 1;
-            seq.last_token_ms = now;
-            if seq.is_done() {
-                done.push(*seq);
+
+        for id in advanced {
+            if let Some(seq) = self.running.get_mut(id) {
+                seq.tokens_emitted += 1;
+                seq.last_token_ms = now;
             }
         }
-        for s in &done {
-            self.running.remove(&s.id);
+
+        let mut done = Vec::new();
+        for id in finished {
+            match self.running.remove(id) {
+                Some(seq) => {
+                    self.flagged.remove(id);
+                    done.push(seq);
+                }
+                None => self.unknown_finish_reports += 1,
+            }
         }
+
+        // Our count says a sequence has emitted its whole budget but the engine
+        // did not list it in `finished`. This is NOT expected pipeline skew:
+        // `tokens` and `finished` arrive in the same `DecodeStepOutcome` and so
+        // describe the same engine step. It means the two sides are keeping
+        // different books - most likely our `requested_tokens` does not match
+        // what the engine was actually told. The engine still wins, so the
+        // sequence is left running; the counter exists so a persistent mismatch
+        // is visible instead of silently capping every request one token early.
+        for seq in self.running.values() {
+            if seq.is_done() && self.flagged.insert(seq.id) {
+                self.finish_disagreements += 1;
+            }
+        }
+
         done
     }
 
+    /// Simulator- and unit-test-only convenience: builds `advanced` from
+    /// every running id and `finished` from every running id whose next
+    /// token would reach its budget, then delegates to [`Self::on_step`].
+    /// This reproduces the scheduler's old, pre-job-312007 behaviour, which
+    /// is the correct model *for the simulator* because the simulator's curve
+    /// model advances every sequence every step by construction.
+    ///
+    /// A real deployment must not use this: it must pass the engine's own
+    /// `advanced`/`finished` lists to `on_step`, because "every sequence
+    /// advances every step" is a simulator modelling choice, not a fact about
+    /// the runtime.
+    pub fn on_step_synthetic(&mut self, now: Millis, step_ms: f64) -> Vec<RunningSeq> {
+        let advanced: Vec<RequestId> = self.running.keys().copied().collect();
+        let finished: Vec<RequestId> = self
+            .running
+            .values()
+            .filter(|s| s.tokens_emitted + 1 >= s.requested_tokens)
+            .map(|s| s.id)
+            .collect();
+        self.on_step(now, step_ms, &advanced, &finished)
+    }
+
     pub fn remove(&mut self, id: RequestId) -> Option<RunningSeq> {
+        self.flagged.remove(&id);
         self.running.remove(&id)
     }
 }
@@ -449,10 +532,59 @@ mod tests {
     fn stepping_retires_sequences_that_reached_their_token_count() {
         let mut s = DecodeScheduler::new(20.0, ItlController::new(20.0, 64.0, 1.0, 256.0));
         s.admit(RunningSeq::new(RequestId(1), 0.0, 3));
-        assert!(s.on_step(17.0, 17.0).is_empty());
-        let done = s.on_step(34.0, 17.0);
+        assert!(s.on_step_synthetic(17.0, 17.0).is_empty());
+        let done = s.on_step_synthetic(34.0, 17.0);
         assert_eq!(done.len(), 1);
         assert_eq!(s.concurrency(), 0);
         assert_eq!(done[0].tokens_emitted, 3);
+    }
+
+    /// The engine's `advanced` list is authoritative: a running sequence left
+    /// out of it must not be credited with a token it was not reported to
+    /// have received.
+    #[test]
+    fn a_sequence_not_in_advanced_is_not_incremented() {
+        let mut s = DecodeScheduler::new(20.0, ItlController::new(20.0, 64.0, 1.0, 256.0));
+        s.admit(RunningSeq::new(RequestId(1), 0.0, 10));
+        let done = s.on_step(10.0, 10.0, &[], &[]);
+        assert!(done.is_empty());
+        let seq = s.running().find(|r| r.id == RequestId(1)).unwrap();
+        assert_eq!(seq.tokens_emitted, 1);
+    }
+
+    /// The engine's `finished` list is authoritative in the other direction
+    /// too: a request it names is retired even if our own `is_done()` would
+    /// have said "not yet".
+    #[test]
+    fn a_sequence_in_finished_is_returned_even_when_not_done() {
+        let mut s = DecodeScheduler::new(20.0, ItlController::new(20.0, 64.0, 1.0, 256.0));
+        s.admit(RunningSeq::new(RequestId(1), 0.0, 200));
+        let done = s.on_step(10.0, 10.0, &[RequestId(1)], &[RequestId(1)]);
+        assert_eq!(done.len(), 1);
+        assert_eq!(s.concurrency(), 0);
+        assert!(!done[0].is_done());
+    }
+
+    /// `is_done()` looking true is not, by itself, grounds to retire a
+    /// sequence: only the engine's `finished` list is. A disagreement is
+    /// counted and the sequence is left running.
+    #[test]
+    fn is_done_without_an_engine_finish_report_stays_running() {
+        let mut s = DecodeScheduler::new(20.0, ItlController::new(20.0, 64.0, 1.0, 256.0));
+        // requested_tokens == 1: RunningSeq::new starts tokens_emitted at 1,
+        // so this sequence is already is_done() before any step is taken.
+        s.admit(RunningSeq::new(RequestId(1), 0.0, 1));
+        let done = s.on_step(10.0, 10.0, &[], &[]);
+        assert!(done.is_empty());
+        assert_eq!(s.concurrency(), 1);
+        assert_eq!(s.finish_disagreements, 1);
+
+        // Counted once per sequence, not once per step. A per-step count would
+        // measure how long we watched rather than how often the two sides
+        // disagree, and one stuck request would run it away on its own.
+        for _ in 0..5 {
+            s.on_step(10.0, 10.0, &[], &[]);
+        }
+        assert_eq!(s.finish_disagreements, 1);
     }
 }
