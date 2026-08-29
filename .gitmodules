@@ -1,0 +1,6 @@
+[submodule "third_party/dynamo"]
+	path = third_party/dynamo
+	url = https://github.com/ai-dynamo/dynamo.git
+[submodule "third_party/TensorRT-LLM"]
+	path = third_party/TensorRT-LLM
+	url = https://github.com/NVIDIA/TensorRT-LLM.git

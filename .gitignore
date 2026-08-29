@@ -7,3 +7,7 @@ Cargo.lock.orig
 .DS_Store
 logs/
 .last_job
+
+# Build trees for the from-source build (kept off the home quota)
+/build
+/third_party/**/build
