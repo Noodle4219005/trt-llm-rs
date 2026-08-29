@@ -1,0 +1,19 @@
+[package]
+name = "trtllm-pyhost"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Embedded-CPython control-plane boundary: drives TensorRT-LLM's PyTorch backend from Rust through PyO3"
+
+[dependencies]
+pyo3 = { version = "0.29", features = ["auto-initialize"] }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+
+[build-dependencies]
+pyo3-build-config = "0.29"
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -12,6 +12,7 @@ members = [
     "crates/sim",
     "crates/tuner",
     "crates/cli",
+    "crates/pyhost",
 ]
 
 [workspace.package]
