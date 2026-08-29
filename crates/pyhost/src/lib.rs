@@ -33,6 +33,7 @@ use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use tokio::sync::oneshot;
 
 /// Commands the dedicated Python thread understands.
@@ -46,6 +47,23 @@ enum Cmd {
     Eval {
         code: String,
         reply: oneshot::Sender<Result<i64>>,
+    },
+    /// Like `Eval`, but extracts the result as a `String` instead of an
+    /// `i64`. Added for gates that read text (e.g. generated output) back
+    /// across the boundary.
+    EvalStr {
+        code: String,
+        reply: oneshot::Sender<Result<String>>,
+    },
+    /// Runs a Python *statement* (not just an expression) against the
+    /// persistent module-level namespace, for effects rather than a value:
+    /// constructing an `LLM`, launching CUDA work on a stream, stashing an
+    /// object for a later crossing to see. See [`run_python_thread`] for why
+    /// a later `Eval`/`Exec`/`EvalStr` on the same `PyHost` can still see
+    /// what an earlier `Exec` assigned.
+    Exec {
+        code: String,
+        reply: oneshot::Sender<Result<()>>,
     },
     Call {
         module: String,
@@ -157,6 +175,33 @@ impl PyHost {
         .await
     }
 
+    /// Evaluates a Python expression and extracts the result as a `String`.
+    pub async fn eval_str(&self, code: &str) -> Result<String> {
+        self.call(|reply| Cmd::EvalStr {
+            code: code.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    /// Runs a Python statement (or block of statements) for its side
+    /// effects against the host's persistent module-level namespace.
+    ///
+    /// Unlike [`eval_int`](Self::eval_int)/[`eval_str`](Self::eval_str),
+    /// which evaluate a single expression, `exec` accepts arbitrary
+    /// statements (assignments, `import`, multi-line blocks) via Python's
+    /// `exec()` semantics. A name bound here (e.g. `llm = tensorrt_llm.LLM(...)`)
+    /// remains visible to a later `exec`/`eval_int`/`eval_str` call on the
+    /// same `PyHost`, even though each call is a separate crossing -- see
+    /// [`run_python_thread`] for why.
+    pub async fn exec(&self, code: &str) -> Result<()> {
+        self.call(|reply| Cmd::Exec {
+            code: code.to_string(),
+            reply,
+        })
+        .await
+    }
+
     /// Benchmarks the Rust <-> Python crossing cost: times 10,000
     /// back-to-back [`ping`](Self::ping) round trips and returns the mean
     /// nanoseconds per crossing.
@@ -191,6 +236,19 @@ impl Drop for PyHost {
 /// [`Python::attach`]); `cmd_rx.recv()` between commands holds no GIL, so
 /// there is nothing here for the GIL to contend with even though this is
 /// the only thread that ever touches it.
+///
+/// # Why state set in one crossing survives to a later one
+///
+/// `globals` is a single `PyDict` created once, right after `initialize`,
+/// and held for the lifetime of this thread -- every `Eval`/`EvalStr`/`Exec`
+/// below runs against this same dict as both globals and locals. The
+/// *interpreter* itself is also process-global and never torn down between
+/// commands. So a name an `Exec` binds (`llm = tensorrt_llm.LLM(...)`, or a
+/// `torch.cuda.Stream` stashed in a module-level dict) is not copied
+/// anywhere -- it is the same Python object, reachable from `globals`, that
+/// a later command on this thread will find still bound. This is what lets
+/// gate 4 create a stream/event in one crossing and observe it, correctly
+/// ordered, from a later one.
 fn run_python_thread(
     rank: usize,
     site_packages: Option<String>,
@@ -211,6 +269,8 @@ fn run_python_thread(
         return;
     }
 
+    let globals: Py<PyDict> = Python::attach(|py| PyDict::new(py).unbind());
+
     for cmd in cmd_rx.iter() {
         match cmd {
             Cmd::Shutdown => break,
@@ -218,7 +278,14 @@ fn run_python_thread(
                 let _ = reply.send(Ok(Python::attach(|_py| ())));
             }
             Cmd::Eval { code, reply } => {
-                let _ = reply.send(Python::attach(|py| eval_expr(py, &code)));
+                let _ = reply.send(Python::attach(|py| eval_expr(py, globals.bind(py), &code)));
+            }
+            Cmd::EvalStr { code, reply } => {
+                let _ =
+                    reply.send(Python::attach(|py| eval_str_expr(py, globals.bind(py), &code)));
+            }
+            Cmd::Exec { code, reply } => {
+                let _ = reply.send(Python::attach(|py| exec_stmt(py, globals.bind(py), &code)));
             }
             Cmd::Call {
                 module,
@@ -295,13 +362,39 @@ fn initialize(rank: usize, site_packages: Option<String>) -> Result<Option<Strin
 /// token's scope, and returned as `Err`. It never panics and never poisons
 /// the worker thread: the `for cmd in cmd_rx.iter()` loop in
 /// [`run_python_thread`] moves straight on to the next command regardless.
-fn eval_expr(py: Python<'_>, code: &str) -> Result<i64> {
+///
+/// `globals` is the host's persistent namespace (see [`run_python_thread`]);
+/// passing it as both globals and locals is what lets this expression see a
+/// name an earlier `Exec` bound.
+fn eval_expr(py: Python<'_>, globals: &Bound<'_, PyDict>, code: &str) -> Result<i64> {
     let c_code = CString::new(code)
         .with_context(|| format!("eval code contained an embedded NUL byte: {code:?}"))?;
-    py.eval(&c_code, None, None)
+    py.eval(&c_code, Some(globals), None)
         .context("Python::eval")?
         .extract()
         .context("eval result did not extract as i64")
+}
+
+/// Like [`eval_expr`], but extracts the result as a `String`.
+fn eval_str_expr(py: Python<'_>, globals: &Bound<'_, PyDict>, code: &str) -> Result<String> {
+    let c_code = CString::new(code)
+        .with_context(|| format!("eval code contained an embedded NUL byte: {code:?}"))?;
+    py.eval(&c_code, Some(globals), None)
+        .context("Python::eval")?
+        .extract()
+        .context("eval result did not extract as String")
+}
+
+/// Runs a Python statement (or block of statements) against `globals` for
+/// its side effects, via the same `PyErr`-to-`anyhow::Error` contract as
+/// [`eval_expr`]. Passing `globals` as both globals and locals means a name
+/// bound here (e.g. `llm = tensorrt_llm.LLM(...)`) lands in the same
+/// persistent namespace a later `Eval`/`EvalStr`/`Exec` reads from.
+fn exec_stmt(py: Python<'_>, globals: &Bound<'_, PyDict>, code: &str) -> Result<()> {
+    let c_code = CString::new(code)
+        .with_context(|| format!("exec code contained an embedded NUL byte: {code:?}"))?;
+    py.run(&c_code, Some(globals), None).context("Python::run")?;
+    Ok(())
 }
 
 /// Calls `module.func(arg)` and extracts the result as an `i64`. See
