@@ -40,9 +40,36 @@ for d in deps:
     # A bare mirror, so `git clone --reference` can satisfy objects from disk. Full history, not
     # shallow: a shallow bare cannot serve as a reference for an arbitrary tag later.
     r = subprocess.run(['git','clone','--bare','--quiet',url,bare])
-    if r.returncode: print(f"  !! {name}: clone failed rc={r.returncode}"); fail += 1
-    else: ok += 1
+    if r.returncode:
+        print(f"  !! {name}: clone failed rc={r.returncode}"); fail += 1; continue
+    # A bare clone only brings objects reachable from a branch. Several deps are pinned to a raw
+    # SHA that is not on any branch head -- DeepEP's 5be51b22 is one -- and those resolve fine
+    # today over the network but would fail the offline build with a useless cmake error hours
+    # in. Fetch the exact pin now, while there is still a network to fetch it from.
+    if tag and re.fullmatch(r'[0-9a-f]{40}', str(tag)):
+        chk = subprocess.run(['git','--git-dir',bare,'rev-parse','--verify','--quiet',f'{tag}^{{commit}}'],
+                             capture_output=True, text=True)
+        if chk.returncode:
+            print(f"     .. {tag[:12]} not reachable from a branch; fetching it directly")
+            subprocess.run(['git','--git-dir',bare,'fetch','--quiet','origin',tag])
+    ok += 1
 print(f"\n  ok={ok} failed={fail} skipped={skip} of {len(deps)}")
+
+# Verify every pin actually resolves. A mirror that silently lacks its pinned commit is worse
+# than no mirror: it turns a free login-node failure into an expensive compute-node one.
+missing = []
+for d in deps:
+    name, tag = d.get('name'), d.get('git_tag')
+    bare = os.path.join(cache, f"{name}.git")
+    if not (name and tag and os.path.isdir(bare)): continue
+    r = subprocess.run(['git','--git-dir',bare,'rev-parse','--verify','--quiet',f'{tag}^{{commit}}'],
+                       capture_output=True, text=True)
+    if r.returncode: missing.append(f"{name} @ {tag}")
+if missing:
+    print("  !! pins NOT resolvable in the mirror -- the offline build WILL fail:")
+    for m in missing: print(f"     {m}")
+    sys.exit(2)
+print(f"  all {len(deps)} pins resolve offline")
 sys.exit(1 if fail else 0)
 PY
 
