@@ -39,6 +39,7 @@ from __future__ import annotations
 import atexit
 import json
 import os
+import random
 import sys
 import time
 from typing import Any
@@ -108,8 +109,47 @@ class ShadowState:
         # with the token counter never moving. Keep the raw shape.
         self.generating_seen = 0
         self.advanced_seen = 0
-        self.itl_samples: list[float] = []
+        # Uniform reservoirs, NOT prefixes. The previous version appended while
+        # `len < 20000`, which keeps the FIRST 20,000 samples and drops every
+        # one after -- at 25 samples per step that is the first ~800 steps, so
+        # the percentiles described the warmup ramp and were labelled as if they
+        # described the run. In job 316849 that read p50 = 93.77 ms while the
+        # steady state was ~15 ms. The comment on it said "Reservoir-ish".
+        self.advancing_itl: list[float] = []
+        self.steer_itl: list[float] = []
+        # One-element lists so the counter can be bumped in place by whoever
+        # holds the matching pool, without naming it again at every call.
+        self.advancing_itl_count = [0]
+        self.steer_itl_count = [0]
         self.reason_first_error = ""
+
+    def reservoir(
+        self,
+        pool: list[float],
+        counter: list[int],
+        sample: float,
+        cap: int = 20000,
+    ) -> None:
+        """Algorithm R: every sample seen keeps an equal chance of being held.
+
+        The version this replaces appended while `len(pool) < cap`, which is a
+        prefix, not a reservoir: it keeps the first `cap` samples and discards
+        every later one. At ~25 samples per scheduler step that is the first
+        ~800 steps, so the percentiles reported the warmup ramp under a name
+        that reads like the whole run.
+        """
+        # Counts live beside their pool rather than behind a formatted
+        # attribute name: this runs once per running request per scheduler
+        # step, ~74 times every 15 ms, in a control plane whose whole budget is
+        # a few percent of the iteration.
+        counter[0] += 1
+        seen = counter[0]
+        if len(pool) < cap:
+            pool.append(sample)
+            return
+        j = random.randrange(seen)
+        if j < cap:
+            pool[j] = sample
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -131,10 +171,19 @@ class ShadowState:
             "advance_fraction": round(
                 self.advanced_seen / self.generating_seen, 4
             ) if self.generating_seen else None,
-            "itl_p50": _pct(self.itl_samples, 0.50),
-            "itl_p90": _pct(self.itl_samples, 0.90),
-            "itl_p99": _pct(self.itl_samples, 0.99),
-            "itl_max": round(max(self.itl_samples), 3) if self.itl_samples else None,
+            # What the controller steers on: time each running request has
+            # waited for its next token. This is the SLO-shaped one.
+            "steer_itl_p50": _pct(self.steer_itl, 0.50),
+            "steer_itl_p90": _pct(self.steer_itl, 0.90),
+            "steer_itl_p99": _pct(self.steer_itl, 0.99),
+            "steer_itl_seen": self.steer_itl_count[0],
+            # Interval between tokens of sequences the engine IS advancing.
+            # Says how fast the engine is, NOT how long requests wait -- the
+            # two differ by exactly the starvation this controller looks for.
+            "advancing_itl_p50": _pct(self.advancing_itl, 0.50),
+            "advancing_itl_p90": _pct(self.advancing_itl, 0.90),
+            "advancing_itl_p99": _pct(self.advancing_itl, 0.99),
+            "advancing_itl_seen": self.advancing_itl_count[0],
             "live": self.live,
             "live_steps": self.live_steps,
             "live_fallbacks": self.live_fallbacks,
@@ -328,9 +377,7 @@ def install() -> bool:
                         sample = (now_ms - prev_ms) / advanced
                         itl_samples.append(sample)
                         STATE.advanced_seen += 1
-                        # Reservoir-ish: keep the shape bounded in memory.
-                        if len(STATE.itl_samples) < 20000:
-                            STATE.itl_samples.append(sample)
+                        STATE.reservoir(STATE.advancing_itl, STATE.advancing_itl_count, sample)
                         STATE.token_progress[rid] = (now_ms, produced)
                 else:
                     STATE.token_progress[rid] = (now_ms, produced)
@@ -372,6 +419,8 @@ def install() -> bool:
 
             if projected:
                 steer = _pct(projected, 0.90) or 0.0
+                for v in projected:
+                    STATE.reservoir(STATE.steer_itl, STATE.steer_itl_count, v)
                 STATE.steer_itl_ms_ewma = (
                     steer if STATE.steer_itl_ms_ewma == 0.0
                     else 0.9 * STATE.steer_itl_ms_ewma + 0.1 * steer

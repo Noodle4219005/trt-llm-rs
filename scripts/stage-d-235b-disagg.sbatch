@@ -396,9 +396,14 @@ check_kv_pool () {
   pool=$(grep -h "tokens in paged KV cache" "$OUT/$tag.log" 2>/dev/null |
            grep -oE "\(([0-9]+)\)" | tr -d '()' | sort -n | tail -1)
   [ -n "$pool" ] || { echo "    $tag KV pool: not reported"; return 0; }
+  # GUARANTEED_NO_EVICT reserves MAX_SEQ_LEN per admitted request, not the
+  # tokens the request will actually use, so the figure to compare against is
+  # concurrency-per-worker x MAX_SEQ_LEN. Before --max-seq-len was set the
+  # engine reserved against the model's 262,144-token window and this estimate
+  # was off by 57x.
   case "$tag" in
-    p*) naive=$(( N * ISL / PREFILL_WORKERS )) ;;
-    *)  naive=$(( N * (ISL + OSL) / DECODE_WORKERS )) ;;
+    p*) naive=$(( N * MAX_SEQ_LEN / PREFILL_WORKERS )) ;;
+    *)  naive=$(( N * MAX_SEQ_LEN / DECODE_WORKERS )) ;;
   esac
   echo "    $tag KV pool $pool tokens (naive need ~$naive)"
   [ "$pool" -lt "$naive" ] && echo "    ^ below the naive figure; 316364 shows that is not decisive either way"
