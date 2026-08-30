@@ -95,7 +95,14 @@ class ShadowState:
         self.token_progress: dict[int, tuple[float, int]] = {}
         # The old proxy, kept only so the two can be compared in one artifact.
         self.iteration_ms_ewma = 0.0
-        self.true_itl_ms_ewma = 0.0
+        # Steering signal: p90 across live started requests of their projected
+        # per-request mean ITL. This is the quantity the SLO is written in.
+        self.steer_itl_ms_ewma = 0.0
+        # Reporting only: mean interval of sequences that advanced this step.
+        # Was called true_itl_ms_ewma, which was a lie -- it is true only when
+        # every resident sequence advances every step.
+        self.advancing_itl_ms_ewma = 0.0
+
         # A mean that equals the iteration gap to four decimals is not evidence
         # that sequences advance once per iteration -- it is equally consistent
         # with the token counter never moving. Keep the raw shape.
@@ -117,7 +124,8 @@ class ShadowState:
             "candidates_seen": self.candidates_seen,
             "observe_calls": self.observe_calls,
             "iteration_ms_ewma": round(self.iteration_ms_ewma, 4),
-            "true_itl_ms_ewma": round(self.true_itl_ms_ewma, 4),
+            "steer_itl_ms_ewma": round(self.steer_itl_ms_ewma, 4),
+            "advancing_itl_ms_ewma": round(self.advancing_itl_ms_ewma, 4),
             "generating_seen": self.generating_seen,
             "advanced_seen": self.advanced_seen,
             "advance_fraction": round(
@@ -329,14 +337,58 @@ def install() -> bool:
             for gone in [r for r in STATE.token_progress if r not in live_ids]:
                 STATE.token_progress.pop(gone, None)
 
-            if itl_samples and generating > 0:
-                measured = sum(itl_samples) / len(itl_samples)
-                STATE.true_itl_ms_ewma = (
-                    measured if STATE.true_itl_ms_ewma == 0.0
-                    else 0.9 * STATE.true_itl_ms_ewma + 0.1 * measured
+            # What the controller steers on. NOT the mean of the samples above.
+            #
+            # Those samples exist only for sequences that advanced this step, so
+            # they describe the population that is being served and say nothing
+            # about the one that is waiting. Job 316849 is the whole argument:
+            # the engine held 26 generating sequences advancing every 15.4 ms
+            # while AIPerf had 74 requests in decode and measured 91 ms, because
+            # the other 48 had produced a first token and were then not
+            # advancing at all. The advanced-only mean read 15.4 ms, the
+            # controller saw itself comfortably inside a 20 ms budget, never
+            # throttled, and goodput was 0.00.
+            #
+            # AIPerf's per-request ITL is (last_token - first_token)/(tokens-1).
+            # Projecting it to now -- (now - first_token)/tokens_since_first --
+            # is the same quantity with any in-progress stall included, so a
+            # request that is currently stuck raises the signal while it is
+            # stuck rather than only once it finishes. Steering on the p90 of
+            # that across live started requests is the same shape as the pass
+            # criterion, which is good_frac >= 0.90.
+            # Time since each running request's last token. Equal to the step
+            # time while everything advances every step; growing exactly when
+            # the engine starves someone. An average anchored at the first
+            # token was tried first and the simulator rejected it -- that
+            # anchor precedes decode admission, so every freshly handed-off
+            # request arrives carrying a latency decode concurrency cannot fix.
+            projected: list[float] = []
+            for i, rid in enumerate(ids):
+                if is_context[i]:
+                    continue
+                last = STATE.token_progress.get(rid)
+                if last is not None:
+                    projected.append(now_ms - last[0])
+
+            if projected:
+                steer = _pct(projected, 0.90) or 0.0
+                STATE.steer_itl_ms_ewma = (
+                    steer if STATE.steer_itl_ms_ewma == 0.0
+                    else 0.9 * STATE.steer_itl_ms_ewma + 0.1 * steer
                 )
-                self._rust.observe(measured, generating)
+                self._rust.observe(steer, len(projected))
                 STATE.observe_calls += 1
+
+            if itl_samples:
+                # Kept for reporting only: the inter-token interval of sequences
+                # the engine is actually advancing. Useful for telling "the
+                # engine is slow" apart from "the engine is starving requests",
+                # which are different failures with different fixes.
+                measured = sum(itl_samples) / len(itl_samples)
+                STATE.advancing_itl_ms_ewma = (
+                    measured if STATE.advancing_itl_ms_ewma == 0.0
+                    else 0.9 * STATE.advancing_itl_ms_ewma + 0.1 * measured
+                )
 
             fitting_idx, paused_idx = self._rust.decide(
                 ids, is_context, prompt_lens, context_done, generated, max_new,

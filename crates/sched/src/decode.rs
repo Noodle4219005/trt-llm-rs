@@ -182,12 +182,31 @@ impl ItlController {
     /// reason TCP does not open the congestion window while it is
     /// application-limited. The first end-to-end simulation caught exactly
     /// this: the cap finished at its 4096 ceiling with a real batch of 58.
-    pub fn observe(&mut self, step_ms: f64, concurrency: usize) {
+    /// Feed one observation of the latency the SLO is written in.
+    ///
+    /// `itl_ms` must be a per-REQUEST inter-token latency across every request
+    /// that has started generating, including ones producing nothing right now.
+    /// Two cheaper quantities have been fed here and both were wrong, in the
+    /// same direction, for the same reason -- they described the requests being
+    /// served and were silent about the ones waiting:
+    ///
+    ///   - the scheduler iteration gap (job 314929: proxy read 11.71 ms while
+    ///     AIPerf measured 39.10 ms on the same run), and
+    ///   - the mean interval of sequences that advanced this step (job 316849:
+    ///     read 15.4 ms across 26 advancing sequences while AIPerf measured
+    ///     91 ms across 74 in decode; the controller never throttled and
+    ///     goodput was 0.00).
+    ///
+    /// Both are equal to ITL only while every resident request advances every
+    /// iteration. That is exactly the condition that stops holding when the
+    /// engine starts rotating requests -- which is the situation this
+    /// controller exists to detect.
+    pub fn observe(&mut self, itl_ms: f64, concurrency: usize) {
         self.samples += 1;
         self.ewma_ms = if self.samples == 1 {
-            step_ms
+            itl_ms
         } else {
-            (1.0 - self.alpha) * self.ewma_ms + self.alpha * step_ms
+            (1.0 - self.alpha) * self.ewma_ms + self.alpha * itl_ms
         };
 
         // Do not steer on a handful of samples; a cold batch is not the steady
@@ -429,10 +448,13 @@ impl DecodeScheduler {
     /// returns the *previous* step's tokens, and not every running sequence
     /// is guaranteed to advance in a given step.
     ///
-    /// `self.controller.observe` is deliberately unchanged: even though which
-    /// sequences a step belongs to is no longer knowable from `self.running`
-    /// alone, a pipelined step's wall time is still the inter-token latency
-    /// the AIMD controller needs to see.
+    /// An earlier version of this comment argued that a pipelined step's wall
+    /// time is still the inter-token latency the controller needs to see. Job
+    /// 316849 refuted it: the engine advanced 26 sequences every 15.4 ms while
+    /// holding 74 in decode, so the step time was inside the 20 ms budget and
+    /// the latency AIPerf scored was 91 ms. Step time equals ITL only while
+    /// every resident request advances every step, and a controller that
+    /// assumes it is blind in precisely the regime it exists for.
     pub fn on_step(
         &mut self,
         now: Millis,
@@ -440,7 +462,17 @@ impl DecodeScheduler {
         advanced: &[RequestId],
         finished: &[RequestId],
     ) -> Vec<RunningSeq> {
-        self.controller.observe(step_ms, self.running.len());
+        // Steer BEFORE booking this step's tokens. Measured after, every
+        // advancing sequence reads an age of zero and the signal collapses to
+        // 0.00 ms -- which is what `a_healthy_batch_reports_the_step_time`
+        // caught. Measured before, a sequence that is about to advance still
+        // shows the interval it just completed, and one that is not shows how
+        // long it has been starving. Both are the quantity we want.
+        //
+        // `step_ms` is the fallback only when nothing is running, because with
+        // no request there is no per-request latency to observe.
+        let steer = self.steering_itl_ms(now).unwrap_or(step_ms);
+        self.controller.observe(steer, self.running.len());
 
         for id in advanced {
             if let Some(seq) = self.running.get_mut(id) {
@@ -475,6 +507,39 @@ impl DecodeScheduler {
         }
 
         done
+    }
+
+    /// p90 of how long each running request has been waiting for its next
+    /// token.
+    ///
+    /// Equal to the step time while every resident request advances every step,
+    /// and growing exactly when the engine starts starving some of them --
+    /// which is the regime a step-time signal is blind to and this controller
+    /// exists for.
+    ///
+    /// Time since the LAST token, not an average since the first. Averaging
+    /// from `first_token_ms` was tried and the simulator rejected it: that
+    /// anchor is when prefill emitted the first token, which can precede
+    /// decode admission by a long handoff, so every freshly admitted request
+    /// arrived carrying a large "ITL" that decode concurrency cannot fix.
+    /// `goodput_saturates_and_then_ttft_degrades` collapsed to zero completed
+    /// requests. Starvation age carries no history from before admission.
+    ///
+    /// p90 rather than the mean because the pass criterion is
+    /// `good_frac >= 0.90`: the ninetieth percentile is the request the score
+    /// actually turns on.
+    fn steering_itl_ms(&self, now: Millis) -> Option<f64> {
+        if self.running.is_empty() {
+            return None;
+        }
+        let mut samples: Vec<f64> = self
+            .running
+            .values()
+            .map(|seq| now - seq.last_token_ms)
+            .collect();
+        samples.sort_by(|a, b| a.partial_cmp(b).expect("itl samples are finite"));
+        let idx = (((samples.len() - 1) as f64) * 0.90).round() as usize;
+        Some(samples[idx])
     }
 
     /// Simulator- and unit-test-only convenience: builds `advanced` from
@@ -752,6 +817,57 @@ mod tests {
             s.controller.observe(19.0, 1);
         }
         assert_eq!(s.can_admit(true), AdmitDecision::WouldSpoilRunning);
+    }
+
+    /// The failure job 316849 shipped with: the engine advances a small subset
+    /// every step while the rest sit resident and starving. The step time stays
+    /// inside the budget, so a controller fed step time sees nothing; the
+    /// latency the benchmark scores is several times worse. The signal must
+    /// come from the requests that are NOT moving.
+    #[test]
+    fn a_starving_request_raises_the_signal_even_while_steps_are_fast() {
+        let mut s = DecodeScheduler::new(20.0, ItlController::new(20.0, 64.0, 1.0, 256.0));
+        // Two sequences the engine keeps advancing, one it has abandoned.
+        s.admit(RunningSeq::new(RequestId(1), 0.0, 100));
+        s.admit(RunningSeq::new(RequestId(2), 0.0, 100));
+        s.admit(RunningSeq::new(RequestId(3), 0.0, 100));
+
+        // Ten fast steps, but request 3 never appears in `advanced`.
+        let mut now = 0.0;
+        for _ in 0..10 {
+            now += 15.0;
+            s.on_step(now, 15.0, &[RequestId(1), RequestId(2)], &[]);
+        }
+
+        // Requests 1 and 2 are at 15 ms. Request 3 has gone 150 ms without a
+        // second token, and it is the one the score turns on.
+        let observed = s.controller.observed_itl_ms();
+        assert!(
+            observed > 20.0,
+            "controller saw {observed:.1} ms; a request starving for 150 ms must \
+             not read as inside a 20 ms budget"
+        );
+    }
+
+    /// The converse, so the fix cannot be "always report something alarming":
+    /// when every resident request advances every step, the signal is the step.
+    #[test]
+    fn a_healthy_batch_reports_the_step_time() {
+        let mut s = DecodeScheduler::new(20.0, ItlController::new(20.0, 64.0, 1.0, 256.0));
+        s.admit(RunningSeq::new(RequestId(1), 0.0, 100));
+        s.admit(RunningSeq::new(RequestId(2), 0.0, 100));
+
+        let mut now = 0.0;
+        for _ in 0..10 {
+            now += 15.0;
+            s.on_step(now, 15.0, &[RequestId(1), RequestId(2)], &[]);
+        }
+
+        let observed = s.controller.observed_itl_ms();
+        assert!(
+            (observed - 15.0).abs() < 1.0,
+            "expected ~15 ms, got {observed:.2} ms"
+        );
     }
 
     #[test]

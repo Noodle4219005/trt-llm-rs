@@ -105,8 +105,24 @@ set -uo pipefail
 # tensor_parallel_size.
 : "${PREFILL_PP:=1}"
 : "${PREFILL_ATTENTION_DP:=0}"
-: "${DECODE_WORKERS:=1}"
-: "${DECODE_TP:=8}"
+# Decode is 2xTP4, not 1xTP8. Job 316849 measured 815 tok/s out of one TP8
+# decode worker, which caps ITL-compliant concurrency at 815 x 0.020 = 16 and
+# goodput at 4.08 req/s -- no better than the 8-GPU aggregated baseline. The
+# team's 2P2D with TP4 decode measured 12.35 req/s and avg ITL 19.81 ms on the
+# same 8 decode GPUs. Qwen3-235B has 4 KV heads: TP4 gives each rank exactly
+# one, TP8 cannot divide them and has to duplicate.
+: "${DECODE_WORKERS:=2}"
+: "${DECODE_TP:=4}"
+
+# The engine defaults to the model's full 262,144-token window, and the
+# capacity policy is GUARANTEED_NO_EVICT -- it only admits what it can promise
+# never to evict, so it reserves against that window instead of the 4,200
+# tokens this workload uses. ISL 4000 + OSL 200 + margin.
+: "${MAX_SEQ_LEN:=4608}"
+# Off by default upstream (DYN_TRTLLM_ENABLE_CUDA_GRAPH default: False), and
+# decode is exactly the small-batch many-step shape where per-step launch
+# overhead across 8 ranks is worth capturing.
+: "${ENABLE_CUDA_GRAPH:=1}"
 # One worker per NODE, using all 8 of its GPUs. Not a preference -- job 315810
 # put a prefill and a decode worker on one node with
 # CUDA_VISIBLE_DEVICES=0,1,2,3 and 4,5,6,7, and the KV transfer deadlocked:
@@ -276,7 +292,7 @@ await_free_gpus () {
 declare -A WPID
 
 launch_worker () {
-  local role="$1" node="$2" tag="$3" tp="$4" gpus="${5:-}" pp="${6:-1}" kvfrac adp=()
+  local role="$1" node="$2" tag="$3" tp="$4" gpus="${5:-}" pp="${6:-1}" kvfrac adp=() cudagraph=()
   # 220.2 GiB of FP8 weights over TP2 is 110.1 GiB on a 131 GiB card, leaving
   # ~21 GiB; asking for 80% of that on top of activations is what killed all
   # four prefill workers in 316051 and 316287. A prefill worker computes KV and
@@ -309,6 +325,9 @@ launch_worker () {
   if [ "$role" = prefill ] && [ "${PREFILL_ATTENTION_DP}" = 1 ]; then
     adp=(--enable-attention-dp)
   fi
+  if [ "${ENABLE_CUDA_GRAPH}" = 1 ]; then
+    cudagraph=(--enable-cuda-graph)
+  fi
   echo "  starting $tag: role=$role node=$node tp=$tp pp=$pp ep=$tp kv=$kvfrac adp=${#adp[@]} gpus=${gpus:-all}"
   srun -N1 -n1 -w "$node" --overlap apptainer exec --nv $BIND \
     ${gpus:+--env "CUDA_VISIBLE_DEVICES=$gpus"} \
@@ -325,6 +344,8 @@ launch_worker () {
       --tensor-parallel-size "$tp" --pipeline-parallel-size "$pp" \
       --expert-parallel-size "$tp" ${adp[@]+"${adp[@]}"} \
       --free-gpu-memory-fraction "$kvfrac" \
+      --max-seq-len "$MAX_SEQ_LEN" \
+      ${cudagraph[@]+"${cudagraph[@]}"} \
       --disaggregation-mode "$role" \
       --extra-engine-args "$OUT/engine.yaml" \
       --discovery-backend file --event-plane zmq \
@@ -441,11 +462,16 @@ NODE_P="${NODES[0]}"; NODE_D="${NODES[1]}"
 # different nodes, so the only thing serialising them bought after that was
 # 108 s of wall clock, which at 16 GPUs is ~29 SU.
 echo; echo "########## NCCL preflight ##########"
-nccl_preflight "$NODE_D" "$DECODE_TP"
+nccl_preflight "$NODE_D" "$(( DECODE_WORKERS * DECODE_TP ))"
 nccl_preflight "$NODE_P" "$(( PREFILL_WORKERS * PREFILL_TP * PREFILL_PP ))"
 
 for w in $(seq 0 $((DECODE_WORKERS - 1))); do
-  launch_worker decode "$NODE_D" "d$w" "$DECODE_TP"
+  if [ "$DECODE_WORKERS" -gt 1 ]; then
+    launch_worker decode "$NODE_D" "d$w" "$DECODE_TP" \
+      "$(seq -s, $((w * DECODE_TP)) $((w * DECODE_TP + DECODE_TP - 1)))"
+  else
+    launch_worker decode "$NODE_D" "d$w" "$DECODE_TP"
+  fi
 done
 for w in $(seq 0 $((PREFILL_WORKERS - 1))); do
   g=$(( PREFILL_TP * PREFILL_PP ))
