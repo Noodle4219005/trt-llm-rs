@@ -89,7 +89,7 @@ set -uo pipefail
 # rather than just the pass/fail:
 #   1. prefill sustains >= 45,845 tok/s      (+11% over the p90 it has shown)
 #   2. decode delivers  >= 2,281 tok/s       (SGLang 2xTP4 reference: 2,170-2,470)
-# Decode is the tighter side, and it is exactly where --enable-cuda-graph and
+# Decode is the tighter side, and it is exactly where cuda_graph_config and
 # --max-seq-len 4608 should land: job 316849 ran with CUDA graphs off and a
 # 262,144-token reservation, and the SGLang reference numbers come from an
 # engine with neither handicap.
@@ -153,10 +153,18 @@ set -uo pipefail
 # never to evict, so it reserves against that window instead of the 4,200
 # tokens this workload uses. ISL 4000 + OSL 200 + margin.
 : "${MAX_SEQ_LEN:=4608}"
-# Off by default upstream (DYN_TRTLLM_ENABLE_CUDA_GRAPH default: False), and
-# decode is exactly the small-batch many-step shape where per-step launch
-# overhead across 8 ranks is worth capturing.
-: "${ENABLE_CUDA_GRAPH:=1}"
+# CUDA graphs are configured through --extra-engine-args, NOT through
+# --enable-cuda-graph. That flag exists on `dynamo.trtllm`, is accepted, and is
+# wired only into the diffusion engine: `grep -c enable_cuda_graph` over the LLM
+# worker path returns 0, and job 316849 duly logged `cuda_graph=False` while the
+# flag was being passed. A flag that is accepted and does nothing is worse than
+# one that errors.
+#
+# Both numbers matter. CudaGraphConfig defaults to max_batch_size=0 and
+# enable_padding=False, so enabling capture without setting them captures
+# nothing, and without padding a decode batch that varies misses whatever was
+# captured. Decode residency at N=80 is ~23 per worker; 64 leaves headroom.
+: "${CUDA_GRAPH_MAX_BATCH:=64}"
 # One worker per NODE, using all 8 of its GPUs. Not a preference -- job 315810
 # put a prefill and a decode worker on one node with
 # CUDA_VISIBLE_DEVICES=0,1,2,3 and 4,5,6,7, and the KV transfer deadlocked:
@@ -199,6 +207,12 @@ unset NATS_SERVER ETCD_ENDPOINTS ETCD_URL 2>/dev/null
 export DYN_LOG=info
 
 cat > "$OUT/engine.yaml" <<YAML
+cuda_graph_config:
+  # max_batch_size defaults to 0 and enable_padding to False, so a capture that
+  # is merely "enabled" captures nothing and a varying decode batch misses what
+  # little it did capture. Decode residency at N=80 is ~23 per worker.
+  max_batch_size: ${CUDA_GRAPH_MAX_BATCH:-64}
+  enable_padding: true
 # Mandatory for disaggregated serving. Without it the prefill worker dies on the
 # first real request, not at startup. UCX rather than DEFAULT: DEFAULT resolves
 # to NIXL, which FileLocks a hardcoded path under the node-shared /tmp.
@@ -326,7 +340,7 @@ await_free_gpus () {
 declare -A WPID
 
 launch_worker () {
-  local role="$1" node="$2" tag="$3" tp="$4" gpus="${5:-}" pp="${6:-1}" kvfrac adp=() cudagraph=()
+  local role="$1" node="$2" tag="$3" tp="$4" gpus="${5:-}" pp="${6:-1}" kvfrac adp=()
   # 220.2 GiB of FP8 weights over TP2 is 110.1 GiB on a 131 GiB card, leaving
   # ~21 GiB; asking for 80% of that on top of activations is what killed all
   # four prefill workers in 316051 and 316287. A prefill worker computes KV and
@@ -359,9 +373,6 @@ launch_worker () {
   if [ "$role" = prefill ] && [ "${PREFILL_ATTENTION_DP}" = 1 ]; then
     adp=(--enable-attention-dp)
   fi
-  if [ "${ENABLE_CUDA_GRAPH}" = 1 ]; then
-    cudagraph=(--enable-cuda-graph)
-  fi
   echo "  starting $tag: role=$role node=$node tp=$tp pp=$pp ep=$tp kv=$kvfrac adp=${#adp[@]} gpus=${gpus:-all}"
   srun -N1 -n1 -w "$node" --overlap apptainer exec --nv $BIND \
     ${gpus:+--env "CUDA_VISIBLE_DEVICES=$gpus"} \
@@ -379,7 +390,6 @@ launch_worker () {
       --expert-parallel-size "$tp" ${adp[@]+"${adp[@]}"} \
       --free-gpu-memory-fraction "$kvfrac" \
       --max-seq-len "$MAX_SEQ_LEN" \
-      ${cudagraph[@]+"${cudagraph[@]}"} \
       --disaggregation-mode "$role" \
       --extra-engine-args "$OUT/engine.yaml" \
       --discovery-backend file --event-plane zmq \
@@ -500,6 +510,10 @@ NODE_P="${NODES[0]}"; NODE_D="${NODES[1]}"
 # (d0 at 108 s, p0-p3 at 138/6/12/6 s, no host OOM anywhere). They are on
 # different nodes, so the only thing serialising them bought after that was
 # 108 s of wall clock, which at 16 GPUs is ~29 SU.
+echo; echo "########## engine.yaml validation ##########"
+srun -N1 -n1 -w "$NODE_P" --overlap apptainer exec $BIND "$SIF" \
+  python3 "$SRC/scripts/validate_engine_yaml.py" "$OUT/engine.yaml" || exit 28
+
 echo; echo "########## NCCL preflight ##########"
 nccl_preflight "$NODE_D" "$(( DECODE_WORKERS * DECODE_TP ))"
 nccl_preflight "$NODE_P" "$(( PREFILL_WORKERS * PREFILL_TP * PREFILL_PP ))"
