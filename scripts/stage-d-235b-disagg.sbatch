@@ -7,25 +7,34 @@
 # the model allows N >= 80 (aggregated it predicts 24.1 ms at N=80, over the
 # 20 ms gate). See knowledge/experiments/2026-08-30-plan-16gpu-official-benchmark.md
 #
-# TOPOLOGY 4P + 1D, TP == EP. Four TP2/EP2 prefill workers on node A, one
-# TP8/EP8 decode worker on node B. This is the shape the team has measured
-# highest on (goodput 19.5 on SGLang) and the one AIConfigurator recommends for
-# this model; it is not derived here.
+# TOPOLOGY 2P + 2D, TP4 everywhere. Two TP4/EP4 prefill workers on node A, two
+# TP4/EP4 decode workers on node B. Declared N is 80. Expected goodput if it
+# passes: 11.46 req/s.
 #
-# An earlier version of this file argued for 1P+3D from a measured 3.94 req/s.
-# That was wrong twice over: 3.94 req/s was itself capped by the 8-GPU config it
-# came from, so sizing prefill against it was circular, and one TP4 prefill
-# worker tops out near 10.75 req/s (93 ms per 4000-token prompt), far under what
-# the decode side can consume. The retraction is kept visible rather than
-# deleted -- see the AGENTS.md rule about not silently rewriting history.
+# TP4 AND NOT TP8, for a measured reason. Qwen3-235B has 4 KV heads: TP4 gives
+# each rank exactly one, TP8 cannot divide them and duplicates -- which
+# crates/transfer's own reshard tests already model
+# (tp2_to_tp8_replicates_each_head_across_two_ranks). One TP8 decode worker
+# measured 815 tok/s (job 316849), which caps ITL-compliant concurrency at 16
+# and goodput at 4.08 req/s, no better than the 8-GPU aggregated baseline. The
+# team's 2P2D on TP4 measured 2,170-2,470 tok/s on the same 8 decode GPUs.
 #
-# THE LOAD FIX THIS RUN CARRIES. Every rank used to hold its own copy of the
-# 221 GB checkpoint because safetensors.torch.load_file copies out of the
-# mapping into anonymous memory. Eight ranks in one MPI world is 1.77 TB against
-# nano4's 8 x 200 GB ceiling, which is why TP8 failed every time while four
-# serialised TP2 workers -- eight ranks too, but only two loading at once --
-# never did. TRTLLM_RS_MMAP_WEIGHTS=1 returns MAP_PRIVATE views instead, so the
-# eight ranks share one page-cache copy. scripts/trtllm_rs_mmap_weights.py.
+# N=80 AND NOT LESS. Goodput is throughput here, and throughput rises with N
+# until a gate binds, so the best declarable N is the largest that still passes.
+# See the derivation at the N default below: 96 is already impossible on
+# prefill, 80 is the edge, 64 is the fallback with margin at 9.17 req/s.
+#
+# THREE SHAPES THAT ARE RETRACTED, kept so they are not re-derived:
+#  - 1P+3D, sized from a measured 3.94 req/s. Circular: that figure was itself
+#    capped by the 8-GPU config it came from, and one TP4 prefill worker tops
+#    out near 10.75 req/s, far above what it was sized against.
+#  - 4P+1D on TP2 prefill. 220.2 GiB of FP8 weights over TP2 is 110.1 GiB on a
+#    131 GiB card, and the ~21 GiB left cannot hold the activation workspace,
+#    the CUDA graphs and a KV pool at once. Measured from both sides:
+#    kv=0.30 serves but dies under AIPerf's opening burst with "No free block
+#    found"; kv=0.50 stalls in warmup and never registers; kv=0.70 OOMs at
+#    startup. The window is empty.
+#  - 2P+1D with a TP8 decode worker, above.
 #
 # WHAT THIS DOES AND DOES NOT TEST. The P/D handoff is upstream's
 # (dynamo.trtllm --disaggregation-mode + TensorRT-LLM's cache transceiver); our
@@ -50,10 +59,11 @@
 #
 #SBATCH -J stage-d-235b-disagg
 #SBATCH -A acd110018
-# Partition/nodes/GPUs come from the submit line so the same script runs the
-# affordable 8-GPU 1P+1D probe and the full 16-GPU 1P+3D shape:
-#   sbatch -p dev    -N 1 --gres=gpu:H200:8 --export=ALL,N=32,DECODE_WORKERS=1 ...
-#   sbatch -p 16gpus -N 2 --gres=gpu:H200:8 --export=ALL,N=80,DECODE_WORKERS=3 ...
+# Partition/nodes/GPUs come from the submit line. The defaults below are the
+# 16-GPU 2P2D shape; --exclude is not optional, see the NCCL note on 143.
+#   sbatch -p 16gpus -N 2 --gres=gpu:H200:8 -t 00:15:00 \
+#     --exclude=25a-hgpn142,25a-hgpn143 scripts/stage-d-235b-disagg.sbatch
+#   ... --export=ALL,N=64   # the fallback with margin, goodput 9.17 req/s
 #SBATCH --ntasks-per-node=1
 #SBATCH -c 96
 #SBATCH --mem=0
@@ -97,13 +107,16 @@ set -uo pipefail
 # If it fails, N=64 is the derived fallback: same configuration, +39% and +19%
 # margin, goodput 9.17 req/s.
 : "${N:=80}"
-# The official AIPerf shape, kept next to the workers that must size their KV
-# pools for it. Changing either of these without changing line ~402 makes the
-# startup pool check silently wrong.
+# The official AIPerf shape. Reported by the startup KV-pool check for context;
+# the check itself sizes against MAX_SEQ_LEN, because GUARANTEED_NO_EVICT
+# reserves that per admitted request rather than what the request will use.
+# Keep these in step with the --synthetic-input-tokens-mean and
+# --output-tokens-mean passed to aiperf below.
 : "${ISL:=4000}"
 : "${OSL:=200}"
-# 2P1D, not 4P1D. Four TP2 prefill workers is the shape the team measures highest
-# on, and it is not reachable on this hardware with TensorRT-LLM: 220.2 GiB of
+# Two prefill workers of four GPUs each, not four of two. Four TP2 workers is
+# the shape the team measures highest on, and it is not reachable on this
+# hardware with TensorRT-LLM: 220.2 GiB of
 # FP8 weights over TP2 is 110.1 GiB on a 131 GiB card, and the ~21 GiB left has
 # to hold the activation workspace AND the KV pool. Three measurements close the
 # window from both sides:
@@ -118,7 +131,7 @@ set -uo pipefail
 # against ~23 GiB of headroom. Two prefill workers also have the throughput --
 # one tops out near 10.75 req/s at 93 ms per 4000-token prompt, so two is
 # ~21.5 req/s, above the 19.5 the team has measured end to end. Still 16 GPUs:
-# 2x4 on the prefill node, 1x8 on decode.
+# 2x4 on the prefill node, 2x4 on the decode node.
 #
 # The weight arithmetic does NOT depend on which axis the four are split on --
 # 220.2 GiB over four GPUs is 55 GiB each however it is cut. What the axis
@@ -192,8 +205,8 @@ mkdir -p "$OUT" "$STAGE"
 # One worker per NODE, one node per worker. This is the only shape that dodges
 # both failure modes at once: two workers on one node gave each process a false
 # gpus_per_node and deadlocked the transceiver (315810), while eight ranks on one
-# node (TP8) exhausted mmap and threads during load (315919, 315920). Four nodes
-# of four GPUs gives 1P+3D at TP4 with four ranks per node.
+# node (TP8) exhausted mmap and threads during load (315919, 315920). Two nodes
+# of eight GPUs, split 2x4 per node, gives four ranks per worker.
 mapfile -t NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
 NODE_A="${NODES[0]}"
 HTTP_PORT=$((20000 + (SLURM_JOB_ID * 7) % 20000))
@@ -276,10 +289,9 @@ sleep 20
 # on one node exhaust the cgroup (job 314880: "unable to mmap ... Cannot allocate
 # memory" plus "can't start new thread"). Serialising is nearly free because the
 # first worker pulls the weights into page cache for the ones after it.
-# 4P1D with TP == EP, the shape AIConfigurator recommends for this model and the
-# one the team has measured highest on. Four TP2/EP2 prefill workers share node A
-# (two GPUs each, so they need CUDA_VISIBLE_DEVICES); the single TP8/EP8 decode
-# worker owns node B outright and gets no isolation.
+# 2P2D with TP == EP. Two TP4/EP4 prefill workers share node A and two TP4/EP4
+# decode workers share node B, four GPUs each, so both sides need
+# CUDA_VISIBLE_DEVICES isolation.
 #
 # The device isolation on node A is NOT believed to be the deadlock cause any
 # more: job 315954 removed it entirely -- one worker per node, gpus_per_node 8,
