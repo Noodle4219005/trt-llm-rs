@@ -62,7 +62,31 @@
 #SBATCH -e /work/u5727520/trt-llm-rs-runs/logs/%x-%j.err
 
 set -uo pipefail
-: "${N:=80}"
+# N=32, not 80, and this is derived rather than tried.
+#
+# Little's law held to 2.5% on job 316849 (predicted N=78 for the measured
+# 4.08 req/s, 996 ms TTFT and 91 ms ITL; actual 80), so it can be used forward.
+# Once the decode fixes land, prefill becomes the binding constraint at the
+# measured 27,870 tok/s over two TP4 workers = 6.97 req/s, and then
+#
+#     N = throughput x (TTFT + 199 x ITL)
+#
+# pins TTFT for any N. At N=80 that is 7.5-9.1 s against a 3 s gate depending
+# on where decode ITL settles -- so N=80 fails on TTFT no matter how well the
+# decode side is fixed, and would burn the run proving it. N=32 passes in both
+# the 12 ms and 20 ms ITL scenarios with TTFT 0.6-2.2 s.
+#
+# Predicted goodput is therefore ~7 req/s, the prefill ceiling. Three
+# independent SGLang 2P2D runs measured 7.77 and 8.11 req/s, which is the same
+# number within 12%. This is BELOW the 14 target: exceeding it needs roughly
+# twice the prefill throughput, which on 16 GPUs would leave nothing for
+# decode, so it is a kernel/speculative-decoding problem rather than a topology
+# one.
+#
+# Weakest link in that derivation: 6.97 req/s is throughput while prefill was
+# ACTIVE, measured at a prefill concurrency of only 4.06, so it may not be
+# saturated. If prefill scales further, the usable N goes up with it.
+: "${N:=32}"
 # The official AIPerf shape, kept next to the workers that must size their KV
 # pools for it. Changing either of these without changing line ~402 makes the
 # startup pool check silently wrong.
