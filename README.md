@@ -1,8 +1,16 @@
 # trt-llm-rs
 
-A Rust control plane for disaggregated LLM serving — a replacement for the
-Python halves of NVIDIA Dynamo and TensorRT-LLM, keeping their CUDA kernels and
-rewriting everything that decides *which* tokens run and *when*.
+A Rust control plane for disaggregated LLM serving: it takes over the
+*policy* in NVIDIA Dynamo and TensorRT-LLM — which requests are admitted and
+when — and leaves their mechanism where it is.
+
+Scope narrowed deliberately and it is worth stating up front, because an
+earlier version of this file claimed the project rewrites "everything that
+decides which tokens run and when". It does not. ADR 0034: the Rust scheduler
+is substituted for TensorRT-LLM's capacity scheduler through the duck-typed
+`RequestScheduler` seam, and the ~298-line overlap executor loop is left alone
+because that loop is worth +67% ITL (job 312007). ADR 0035 put the size of the
+finished adapter at four items, not 2,837 new lines.
 
 Target workload: Qwen3-235B-A22B-Instruct FP8, ISL 4000 / OSL 200, 16×H200,
 closed loop.
@@ -152,16 +160,47 @@ real metric, and ranks them. See `docs/aiconfigurator.md`.
   `TransferStats::moved_data()` exists so nothing downstream is interpreted
   before that is checked.
 
-## Status
+## Status, and what has actually been measured on hardware
 
-Everything above is implemented and unit tested against the measured numbers.
-Two seams are deliberately unbuilt in this tree and clearly marked:
+The Rust scheduler runs live inside TensorRT-LLM on 16 GPUs. It is installed
+through `scripts/usercustomize.py`, which reaches the MPI-spawned executor
+ranks, rather than through the C++ Executor FFI — that seam
+(`crates/engine` feature `trtllm`) and the NIXL binding (`crates/transfer`
+feature `nixl`) are still unbuilt, and `docs/trtllm-ffi.md` and
+`docs/kv-transfer.md` say so. The TP-reshard *mapping* NIXL depends on is
+implemented and tested, because that is the part that fails silently.
 
-- `crates/engine` feature `trtllm` — the TensorRT-LLM C++ Executor binding.
-  Needs a CUDA toolchain and a TensorRT-LLM install; see `docs/trtllm-ffi.md`.
-- `crates/transfer` feature `nixl` — the NIXL/UCX binding; see
-  `docs/kv-transfer.md`. The TP-reshard *mapping* it depends on is implemented
-  and tested, because that is the part that fails silently.
+**Job 316364, 4P1D, 16 GPUs.** RustScheduler live in all eight decode ranks:
+599,299 steps, 0 fallbacks, 0 malformed, 0 errors, engine-side ITL p99
+15.4 ms. The control plane works.
+
+**Job 316849, the first complete official AIPerf run. Goodput 0.00 req/s.**
+TTFT passes (p90 2,981 ms against a 3,000 ms gate). ITL does not: 91 ms against
+20 ms. The decode engine advanced 26 of 80 resident sequences per step and the
+queueing turned a 15 ms engine step into a 91 ms user-visible interval. Request
+throughput 4.08 req/s, output 815 tok/s.
+
+Three causes were found afterwards and are fixed but **not yet re-measured**,
+because the GPU budget ran out:
+
+- `--enable-cuda-graph` is accepted by `dynamo.trtllm` and wired only into its
+  diffusion engine; the LLM path references it zero times. CUDA graphs were
+  never on. They now go through `--extra-engine-args`, which is itself
+  unvalidated upstream, so `scripts/validate_engine_yaml.py` checks the keys.
+- `max_seq_len` defaulted to the model's 262,144-token window while the
+  capacity policy is `GUARANTEED_NO_EVICT`, so the engine reserved against that
+  rather than the 4,200 tokens this workload uses.
+- One TP8 decode worker delivered 815 tok/s. Qwen3-235B has 4 KV heads: TP4
+  gives each rank one, TP8 must duplicate. The topology is now 2P2D on TP4.
+
+The predicted result of that configuration, derived rather than hoped for, is
+in the `N` default of `scripts/stage-d-235b-disagg.sbatch`: N=80 is the largest
+declarable concurrency that can still pass, and passing it means goodput
+11.46 req/s. It rests on two numbers the next run should read off directly —
+prefill sustaining 45,845 tok/s and decode delivering 2,281 tok/s.
+
+**No run in this tree has yet passed the official criterion.** The 16.4 quoted
+at the top is an external reference and remains unmatched.
 
 ## Build
 
