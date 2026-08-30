@@ -62,31 +62,41 @@
 #SBATCH -e /work/u5727520/trt-llm-rs-runs/logs/%x-%j.err
 
 set -uo pipefail
-# N=32, not 80, and this is derived rather than tried.
+# N=80, and it is the theoretical optimum rather than a round number.
 #
-# Little's law held to 2.5% on job 316849 (predicted N=78 for the measured
-# 4.08 req/s, 996 ms TTFT and 91 ms ITL; actual 80), so it can be used forward.
-# Once the decode fixes land, prefill becomes the binding constraint at the
-# measured 27,870 tok/s over two TP4 workers = 6.97 req/s, and then
+# Goodput IS throughput here, and throughput rises with N until a gate binds,
+# so the best declarable N is the largest one that still passes. Inverting
+# Little's law -- which held to 2.5% on job 316849 -- with ITL sitting exactly
+# on its 20 ms budget (that maximises the latency budget and so minimises the
+# throughput required):
 #
-#     N = throughput x (TTFT + 199 x ITL)
+#   N    throughput   prefill needed   vs p90 50,925   decode needed   vs 2,170
+#   32     4.58/s          18,338          +178%             912         +138%
+#   64     9.17/s          36,676           +39%           1,825          +19%
+#   80    11.46/s          45,845           +11%           2,281           -5%
+#   96    13.75/s          55,014            -7%           2,737          -21%
 #
-# pins TTFT for any N. At N=80 that is 7.5-9.1 s against a 3 s gate depending
-# on where decode ITL settles -- so N=80 fails on TTFT no matter how well the
-# decode side is fixed, and would burn the run proving it. N=32 passes in both
-# the 12 ms and 20 ms ITL scenarios with TTFT 0.6-2.2 s.
+# 96 is already impossible on prefill. 80 is the edge, and passing it means
+# goodput 11.46 req/s.
 #
-# Predicted goodput is therefore ~7 req/s, the prefill ceiling. Three
-# independent SGLang 2P2D runs measured 7.77 and 8.11 req/s, which is the same
-# number within 12%. This is BELOW the 14 target: exceeding it needs roughly
-# twice the prefill throughput, which on 16 GPUs would leave nothing for
-# decode, so it is a kernel/speculative-decoding problem rather than a topology
-# one.
+# The prefill figure is the p90 of Active Prefill Throughput from job 316849,
+# NOT its average. The average was 27,870 and reading that as capacity is what
+# produced an earlier estimate of 7 req/s -- but prefill sat at a concurrency
+# of 4.06 out of 80 in that run, so the average measures how idle it was, not
+# how fast it is. p50 21,027 / p90 50,925 / p99 113,961 / max 129,939.
 #
-# Weakest link in that derivation: 6.97 req/s is throughput while prefill was
-# ACTIVE, measured at a prefill concurrency of only 4.06, so it may not be
-# saturated. If prefill scales further, the usable N goes up with it.
-: "${N:=32}"
+# TWO CONDITIONS DECIDE THIS RUN, and both are worth reading off the result
+# rather than just the pass/fail:
+#   1. prefill sustains >= 45,845 tok/s      (+11% over the p90 it has shown)
+#   2. decode delivers  >= 2,281 tok/s       (SGLang 2xTP4 reference: 2,170-2,470)
+# Decode is the tighter side, and it is exactly where --enable-cuda-graph and
+# --max-seq-len 4608 should land: job 316849 ran with CUDA graphs off and a
+# 262,144-token reservation, and the SGLang reference numbers come from an
+# engine with neither handicap.
+#
+# If it fails, N=64 is the derived fallback: same configuration, +39% and +19%
+# margin, goodput 9.17 req/s.
+: "${N:=80}"
 # The official AIPerf shape, kept next to the workers that must size their KV
 # pools for it. Changing either of these without changing line ~402 makes the
 # startup pool check silently wrong.
