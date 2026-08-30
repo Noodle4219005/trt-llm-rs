@@ -6,18 +6,24 @@
 //! * [`mock::MockEngine`] costs a batch from the calibrated model. It runs on a
 //!   laptop, it is deterministic, and it is what lets a scheduling policy be
 //!   accepted or rejected before anyone spends a GPU-hour on it.
-//! * [`trtllm::TrtllmEngine`] binds the TensorRT-LLM C++ Executor API. It is
-//!   behind the `trtllm` feature, needs a CUDA toolchain, and is **not built or
-//!   tested in this tree** - see `docs/trtllm-ffi.md` for the shim it expects.
 //!
-//! Keeping the seam this narrow is the whole point of the rewrite. Everything
-//! that decides *which* tokens run and *when* is Rust; everything that decides
-//! how fast a GEMM goes stays in the kernels that already do it well.
+//! There is deliberately no TensorRT-LLM engine here any more. This trait's
+//! `decode_step()` presumes the caller decides when the next step happens, and
+//! under ADR 0034 it does not: TensorRT-LLM drives its own executor loop and
+//! calls Rust once per step for the admission decision. So this trait now
+//! describes the simulator's world, not the serving path -- which is exactly
+//! what it is good at, since `MockEngine` is how a scheduling policy gets
+//! accepted or rejected for zero GPU-hours.
+//!
+//! The removed `trtllm::TrtllmEngine` bound the C++ Executor API through
+//! `extern "C"`. That path is legacy upstream and is never reached by the
+//! PyTorch backend we actually run, so every one of its methods returned
+//! `not implemented` -- a stub that reads as "unfinished" when the truth is
+//! "abandoned on purpose". The real binding is `crates/pyext`, and it goes the
+//! other way: Python loads Rust, not Rust loading C++.
 
 pub mod cost;
 pub mod mock;
-#[cfg(feature = "trtllm")]
-pub mod trtllm;
 
 use async_trait::async_trait;
 use trtllm_core::{Millis, Phase, RequestId};

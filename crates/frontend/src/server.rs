@@ -54,7 +54,15 @@ pub fn router(state: Arc<AppState>) -> Router {
 pub async fn serve(state: Arc<AppState>, addr: std::net::SocketAddr) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "frontend listening");
-    axum::serve(listener, router(state)).await
+    // TCP_NODELAY, because this socket carries one small SSE frame per token.
+    //
+    // axum 0.7.9 defaults it to None (serve.rs:101), i.e. Nagle on. Nagle holds
+    // a small write until the previous segment is acknowledged, and with the
+    // peer's delayed-ACK timer that is the classic ~40 ms stall. Job 315393 is
+    // what that looks like from the outside: the engine produced a token every
+    // 14.16 ms, AIPerf's minimum ITL was 13.95 ms -- and its *mean* was 39.06.
+    // Fast tokens and 40 ms tokens, which is the signature, not a slow engine.
+    axum::serve(listener, router(state)).tcp_nodelay(true).await
 }
 
 async fn health() -> impl IntoResponse {

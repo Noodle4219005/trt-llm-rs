@@ -7,11 +7,6 @@ license.workspace = true
 repository.workspace = true
 description = "Execution backend abstraction: analytic mock engine plus the TensorRT-LLM FFI seam"
 
-[features]
-default = []
-# Compiles the TensorRT-LLM C++ Executor binding. Requires a TensorRT-LLM
-# install and a CUDA toolchain; see docs/trtllm-ffi.md. Never enabled in CI.
-trtllm = []
 
 [dependencies]
 trtllm-core.workspace = true

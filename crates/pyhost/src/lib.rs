@@ -281,8 +281,9 @@ fn run_python_thread(
                 let _ = reply.send(Python::attach(|py| eval_expr(py, globals.bind(py), &code)));
             }
             Cmd::EvalStr { code, reply } => {
-                let _ =
-                    reply.send(Python::attach(|py| eval_str_expr(py, globals.bind(py), &code)));
+                let _ = reply.send(Python::attach(|py| {
+                    eval_str_expr(py, globals.bind(py), &code)
+                }));
             }
             Cmd::Exec { code, reply } => {
                 let _ = reply.send(Python::attach(|py| exec_stmt(py, globals.bind(py), &code)));
@@ -393,7 +394,8 @@ fn eval_str_expr(py: Python<'_>, globals: &Bound<'_, PyDict>, code: &str) -> Res
 fn exec_stmt(py: Python<'_>, globals: &Bound<'_, PyDict>, code: &str) -> Result<()> {
     let c_code = CString::new(code)
         .with_context(|| format!("exec code contained an embedded NUL byte: {code:?}"))?;
-    py.run(&c_code, Some(globals), None).context("Python::run")?;
+    py.run(&c_code, Some(globals), None)
+        .context("Python::run")?;
     Ok(())
 }
 

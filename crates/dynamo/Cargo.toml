@@ -1,0 +1,66 @@
+[package]
+name = "trtllm-dynamo"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/REPLACE-ME/trt-llm-rs"
+description = "Transport-neutral TensorRT-LLM adapter with an optional Dynamo v1.4.1 Worker entrypoint"
+
+# This crate is intentionally a nested workspace until the optional Dynamo
+# adapter is added. Task 3 must be testable without changing the dirty root
+# workspace or compiling vendored Dynamo sources.
+[workspace]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+async-trait = "0.1"
+futures = "0.3"
+trtllm-core = { path = "../core" }
+# The wire protocol lives in its own crate so crates/worker can use it
+# without depending on this one -- see crates/wire/src/lib.rs for why an
+# optional feature could not have achieved that.
+trtllm-wire = { path = "../wire" }
+
+[features]
+default = []
+# The concrete HTTP/SSE transport needs an HTTP client and nothing else. It is
+# split out of `dynamo-v1` because the Rust control plane (crates/worker's
+# serving path) wants exactly this transport and must NOT drag in the whole
+# pinned Dynamo tree to get it -- dynamo-v1 pulls dynamo-backend-common, which
+# is ~800 crates and a nested workspace.
+http-transport = ["trtllm-wire/http-transport", "dep:bytes", "dep:reqwest"]
+dynamo-v1 = ["http-transport", "dep:anyhow", "dep:dynamo-backend-common"]
+
+[dependencies.anyhow]
+version = "1"
+optional = true
+
+# reqwest 0.12 does not re-export `bytes`, and `response.bytes_stream()` yields
+# `bytes::Bytes`. Naming that type requires the dependency directly; mapping it
+# to Vec<u8> instead would copy every SSE chunk, which this project cannot
+# afford to do casually.
+[dependencies.bytes]
+version = "1"
+optional = true
+
+[dependencies.dynamo-backend-common]
+path = "../../third_party/dynamo/lib/backend-common"
+version = "1.4.1"
+optional = true
+
+[dependencies.reqwest]
+version = "0.12"
+default-features = false
+features = ["json", "stream", "rustls-tls"]
+optional = true
+
+[package.metadata.trtllm_dynamo.integration]
+dynamo_source = "../../third_party/dynamo"
+dynamo_revision = "2112d6ba74da72e2715ae69f4b76458b7691380d"
+dynamo_version = "v1.4.1"
+tensorrt_llm_source = "../../third_party/TensorRT-LLM"
+tensorrt_llm_revision = "8ba93401976877ca2a390104829dd0d54cf2f30f"
+tensorrt_llm_version = "v1.3.0rc22"

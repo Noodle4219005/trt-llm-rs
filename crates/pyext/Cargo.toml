@@ -1,0 +1,37 @@
+[package]
+name = "trtllm-pyext"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Python extension module (`trtllm_rs`) exposing a Rust-backed capacity_scheduler admission decision to TensorRT-LLM's SimpleScheduler"
+
+# The package/lib name stays `trtllm-pyext` (cargo lowers this to
+# `libtrtllm_pyext.so`) -- that is deliberate, not an oversight. The Python
+# import name is `trtllm_rs`, which comes from the `#[pymodule] fn trtllm_rs`
+# in src/lib.rs (PyO3 emits a `PyInit_trtllm_rs` symbol from that name). The
+# two are wired together at deploy time by copying/renaming the built
+# artifact to `trtllm_rs.so`, exactly as scripts/build-pyext.sbatch does.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+trtllm-core = { workspace = true }
+trtllm-sched = { workspace = true }
+# DEVIATION FROM THE ORIGINAL TASK SPEC: no `extension-module` Cargo feature.
+# In pyo3 0.29.2 (confirmed against the vendored source at
+# ~/.cargo/registry/src/*/pyo3-0.29.2/guide/src/building-and-distribution.md
+# and faq.md) that feature is deprecated precisely because it "caused linking
+# to be disabled for all compile targets, including Rust tests and
+# benchmarks" -- job 313115 hit exactly that: `cargo build --release`
+# succeeded (a cdylib is allowed undefined libpython symbols) but
+# `cargo test` failed to link (a test binary is not). The replacement is the
+# `PYO3_BUILD_EXTENSION_MODULE` env var, set only for the release/distribution
+# build invocation in scripts/build-pyext.sbatch, so `cargo test` links
+# normally against the container's libpython (Py_ENABLE_SHARED=1) and the
+# release .so still gets the manylinux-style no-libpython-link treatment.
+# Do NOT add `auto-initialize` -- there is no host interpreter to spin up;
+# TensorRT-LLM's own Python process is the one that dlopen()s this .so, and
+# this crate never calls `Python::attach` itself.
+pyo3 = { version = "0.29.2" }

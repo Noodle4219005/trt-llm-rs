@@ -1,10 +1,48 @@
 //! Cross-checking and scoring AIConfigurator's candidates.
 
 use serde::Serialize;
-use trtllm_core::config::Config;
-use trtllm_sim::{SimReport, SimSetup, Simulator};
+use trtllm_core::{config::Config, GoodputReport};
+use trtllm_sim::{SimSetup, Simulator};
 
 use crate::aic::AicCandidate;
+
+pub trait CandidateEvaluator {
+    fn evaluate(&self, config: &Config) -> GoodputReport;
+}
+
+/// Scores candidate configurations using the deterministic local simulator.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SimulationEvaluator;
+
+impl CandidateEvaluator for SimulationEvaluator {
+    fn evaluate(&self, config: &Config) -> GoodputReport {
+        Simulator::new(SimSetup {
+            config: config.clone(),
+        })
+        .run()
+        .goodput
+    }
+}
+
+/// Injects a score collected by one measured run without duplicating scoring.
+pub struct MeasuredRunEvaluator<F> {
+    measure: F,
+}
+
+impl<F> MeasuredRunEvaluator<F> {
+    pub fn new(measure: F) -> Self {
+        Self { measure }
+    }
+}
+
+impl<F> CandidateEvaluator for MeasuredRunEvaluator<F>
+where
+    F: Fn(&Config) -> GoodputReport,
+{
+    fn evaluate(&self, config: &Config) -> GoodputReport {
+        (self.measure)(config)
+    }
+}
 
 /// AIConfigurator's prediction next to ours, for the same topology.
 ///
@@ -79,7 +117,7 @@ pub struct TuningRow {
     pub label: String,
     pub config: Config,
     pub cross_check: CrossCheck,
-    pub sim: SimReport,
+    pub score: GoodputReport,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -96,6 +134,14 @@ impl TuningPlan {
     /// comes from the candidate, which is the only part AIConfigurator is
     /// better placed to choose than we are.
     pub fn evaluate(candidates: &[AicCandidate], base: &Config) -> Self {
+        Self::evaluate_with(candidates, base, &SimulationEvaluator)
+    }
+
+    pub fn evaluate_with<E: CandidateEvaluator>(
+        candidates: &[AicCandidate],
+        base: &Config,
+        evaluator: &E,
+    ) -> Self {
         let mut plan = Self::default();
         for c in candidates {
             let Some(cfg) = c.apply_to(base) else {
@@ -114,22 +160,18 @@ impl TuningPlan {
                 continue;
             }
             let cross_check = CrossCheck::build(c, &cfg);
-            let sim = Simulator::new(SimSetup {
-                config: cfg.clone(),
-            })
-            .run();
+            let score = evaluator.evaluate(&cfg);
             plan.rows.push(TuningRow {
                 label: c.label(),
                 config: cfg,
                 cross_check,
-                sim,
+                score,
             });
         }
         plan.rows.sort_by(|a, b| {
-            b.sim
-                .goodput
-                .goodput_req_s
-                .total_cmp(&a.sim.goodput.goodput_req_s)
+            b.score
+                .good_output_tok_s
+                .total_cmp(&a.score.good_output_tok_s)
         });
         plan
     }
@@ -148,10 +190,10 @@ impl TuningPlan {
             s.push_str(&format!(
                 "{:<28} {:>10.2} {:>7.1}% {:>8.0}ms {:>9.2}ms {:>16}\n",
                 r.label,
-                r.sim.goodput.goodput_req_s,
-                r.sim.goodput.good_frac * 100.0,
-                r.sim.goodput.ttft.p99,
-                r.sim.goodput.itl.mean,
+                r.score.good_output_tok_s,
+                r.score.good_frac * 100.0,
+                r.score.ttft.p99,
+                r.score.itl.mean,
                 r.cross_check.verdict,
             ));
         }
@@ -191,12 +233,12 @@ mod tests {
     }
 
     #[test]
-    fn candidates_are_ranked_by_simulated_goodput_not_by_the_csv_column() {
+    fn candidates_are_ranked_by_simulated_good_output_rate_not_by_the_csv_column() {
         let plan = TuningPlan::evaluate(&two_rows(), &short_base());
         assert_eq!(plan.rows.len(), 2, "{:?}", plan.skipped);
         for w in plan.rows.windows(2) {
             assert!(
-                w[0].sim.goodput.goodput_req_s >= w[1].sim.goodput.goodput_req_s,
+                w[0].score.good_output_tok_s >= w[1].score.good_output_tok_s,
                 "rows out of order:\n{}",
                 plan.table()
             );
@@ -205,6 +247,31 @@ mod tests {
         // Deliberately NOT asserted: which shape wins. An earlier version
         // pinned the expected winner and the simulation disagreed for a real
         // reason - see `both_prefill_shapes_are_evaluated`.
+    }
+
+    #[test]
+    fn measured_score_wins_even_when_its_request_rate_is_lower() {
+        let evaluator = MeasuredRunEvaluator::new(|cfg: &Config| GoodputReport {
+            req_per_s: if cfg.topology.prefill_tp == 2 {
+                100.0
+            } else {
+                20.0
+            },
+            good_output_tok_s: if cfg.topology.prefill_tp == 2 {
+                10.0
+            } else {
+                100.0
+            },
+            ..Default::default()
+        });
+
+        let plan = TuningPlan::evaluate_with(&two_rows(), &short_base(), &evaluator);
+
+        assert_eq!(plan.rows.len(), 2, "{:?}", plan.skipped);
+        assert_eq!(plan.rows[0].config.topology.prefill_tp, 4);
+        assert_eq!(plan.rows[0].score.good_output_tok_s, 100.0);
+        assert_eq!(plan.rows[0].score.req_per_s, 20.0);
+        assert_eq!(plan.rows[1].score.req_per_s, 100.0);
     }
 
     /// Both shapes must be scored, on the topology the CSV actually describes.
@@ -232,7 +299,7 @@ mod tests {
         for r in &plan.rows {
             assert_eq!(r.config.topology.total_gpus, 16);
             assert!(
-                r.sim.goodput.total_requests > 0,
+                r.score.total_requests > 0,
                 "{} produced no scored requests",
                 r.label
             );
@@ -250,6 +317,21 @@ mod tests {
             plan.rows.is_empty(),
             "4x8 + 1x8 = 40 GPUs must not fit in 16"
         );
+        assert_eq!(plan.skipped.len(), 1);
+    }
+
+    #[test]
+    fn invalid_candidates_are_skipped_before_the_measured_evaluator_runs() {
+        let csv = "(p)workers,(p)tp,(p)pp,(p)dp,(d)workers,(d)tp,(d)pp,(d)dp,num_total_gpus\n\n4,8,1,1,1,8,1,1,16\n";
+        let t = Table::parse(csv).expect("parse");
+        let candidates = candidates_from_table(&t, DeploymentMode::Disagg, "test");
+        let evaluator = MeasuredRunEvaluator::new(|_: &Config| -> GoodputReport {
+            panic!("invalid candidates must not be evaluated")
+        });
+
+        let plan = TuningPlan::evaluate_with(&candidates, &short_base(), &evaluator);
+
+        assert!(plan.rows.is_empty());
         assert_eq!(plan.skipped.len(), 1);
     }
 

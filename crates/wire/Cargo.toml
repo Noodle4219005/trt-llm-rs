@@ -1,0 +1,30 @@
+[package]
+name = "trtllm-wire"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+trtllm-core.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+futures.workspace = true
+
+[dependencies.bytes]
+version = "1"
+optional = true
+
+[dependencies.reqwest]
+version = "0.12"
+default-features = false
+features = ["json", "stream", "rustls-tls"]
+optional = true
+
+[features]
+default = []
+# The concrete HTTP/SSE transport. Optional so the trait-level core stays
+# usable without an HTTP client at all -- crates/sim wants exactly that.
+http-transport = ["dep:bytes", "dep:reqwest"]

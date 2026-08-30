@@ -13,6 +13,7 @@
 pub mod decode_worker;
 pub mod deployment;
 pub mod prefill_worker;
+pub mod serving;
 pub mod tokenizer;
 
 pub use deployment::{Deployment, DeploymentHandle};

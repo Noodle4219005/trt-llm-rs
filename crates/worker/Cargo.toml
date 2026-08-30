@@ -9,6 +9,10 @@ description = "Prefill and decode worker runtimes, and an in-process deployment 
 
 [dependencies]
 trtllm-core.workspace = true
+# `http-transport` is the point: the serving path speaks the worker wire
+# protocol over HTTP/SSE. The trait-level core alone would not give us a
+# client.
+trtllm-wire = { workspace = true, features = ["http-transport"] }
 trtllm-engine.workspace = true
 trtllm-frontend.workspace = true
 trtllm-kvcache.workspace = true
@@ -19,3 +23,6 @@ async-trait.workspace = true
 parking_lot.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+# Exactly what the pinned Dynamo tree pulls (dynamo-tokenizers 1.5.4), so
+# this resolves and builds offline in the container that already compiles it.
+tokenizers = { version = "0.21.4", features = ["onig", "esaxx_fast", "rustls-tls"] }

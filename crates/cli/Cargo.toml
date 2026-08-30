@@ -15,6 +15,7 @@ path = "src/main.rs"
 trtllm-core.workspace = true
 trtllm-engine.workspace = true
 trtllm-frontend.workspace = true
+trtllm-router.workspace = true
 trtllm-sim.workspace = true
 trtllm-tuner.workspace = true
 trtllm-worker.workspace = true

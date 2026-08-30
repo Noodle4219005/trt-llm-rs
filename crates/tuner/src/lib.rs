@@ -44,7 +44,10 @@ pub mod csv;
 pub mod plan;
 
 pub use aic::{AicCandidate, AicRun, DeploymentMode, ParallelSpec};
-pub use plan::{CrossCheck, TuningPlan, TuningRow};
+pub use plan::{
+    CandidateEvaluator, CrossCheck, MeasuredRunEvaluator, SimulationEvaluator, TuningPlan,
+    TuningRow,
+};
 
 use std::path::Path;
 

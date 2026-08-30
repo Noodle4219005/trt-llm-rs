@@ -10,8 +10,11 @@ use trtllm_engine::cost::{DecodeCurve, PrefillCurve};
 use trtllm_engine::mock::{mock_decode_worker, mock_prefill_worker, TimeMode};
 use trtllm_engine::{CostModel, Engine};
 use trtllm_frontend::{serve, server::AppState};
+use trtllm_router::RouterTuning;
 use trtllm_sim::{SimSetup, Simulator};
 use trtllm_tuner::{AicRun, TuningPlan};
+use trtllm_worker::serving::ServingDeployment;
+use trtllm_worker::tokenizer::{HfTokenizer, Tokenizer};
 use trtllm_worker::Deployment;
 
 #[derive(Parser)]
@@ -76,10 +79,24 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Serve on HTTP with mock engines - the whole control plane, no GPUs.
+    /// Serve on HTTP. With `--worker` this is the real control plane in front of
+    /// real engine processes; without it, mock engines and no GPUs.
     Serve {
         #[arg(long, default_value = "127.0.0.1:8000")]
         addr: String,
+        /// Engine endpoint, repeatable: `--worker http://host:8200`. Each is one
+        /// `trtllm-serve`-style process exposing `POST /generate` with SSE.
+        /// Given any, the mock engines are not used at all.
+        #[arg(long = "worker", value_delimiter = ',')]
+        workers: Vec<String>,
+        /// Path to the model's `tokenizer.json`. Required with `--worker`:
+        /// AIPerf sends text, the frontend tokenizes it, and the byte-level
+        /// stand-in would quadruple ISL.
+        #[arg(long)]
+        tokenizer: Option<PathBuf>,
+        /// Model name to advertise on `/v1/models`.
+        #[arg(long)]
+        served_model_name: Option<String>,
     },
 }
 
@@ -135,7 +152,18 @@ fn main() -> Result<()> {
             backend,
             json,
         } => cmd_tune(cfg, save_dir.as_deref(), &system, &backend, json)?,
-        Command::Serve { addr } => cmd_serve(cfg, &addr)?,
+        Command::Serve {
+            addr,
+            workers,
+            tokenizer,
+            served_model_name,
+        } => cmd_serve(
+            cfg,
+            &addr,
+            &workers,
+            tokenizer.as_deref(),
+            served_model_name,
+        )?,
     }
     Ok(())
 }
@@ -271,7 +299,8 @@ fn cmd_tune(
 
     let Some(dir) = save_dir else {
         println!("# 3. re-run this command with --save-dir {out_dir} to score the candidates");
-        println!("#    under the metric we are actually judged on (per-request good_frac),");
+        println!("#    ranked by official score: good_output_tok_s (good output tokens from good requests per benchmark window);");
+        println!("#    good_frac is only the passing-request fraction, not the ranked metric.");
         println!("#    which AIConfigurator does not model.");
         return Ok(());
     };
@@ -294,22 +323,31 @@ fn cmd_tune(
         println!("{}", plan.table());
         if let Some(best) = plan.best() {
             println!("best: {}", best.label);
-            println!("  {}", best.sim.summary());
+            println!(
+                "  official score: {:.2} good output tokens/s",
+                best.score.good_output_tok_s
+            );
             println!(
                 "  cross-check vs AIConfigurator: {} - {}",
                 best.cross_check.verdict, best.cross_check.note
             );
-            for c in best.sim.caveats() {
-                println!("  CAVEAT: {c}");
-            }
         }
     }
     Ok(())
 }
 
-fn cmd_serve(cfg: Config, addr: &str) -> Result<()> {
+fn cmd_serve(
+    cfg: Config,
+    addr: &str,
+    workers: &[String],
+    tokenizer: Option<&std::path::Path>,
+    served_model_name: Option<String>,
+) -> Result<()> {
     cfg.validate()?;
     let addr: std::net::SocketAddr = addr.parse().context("parsing --addr")?;
+    if !workers.is_empty() {
+        return cmd_serve_real(cfg, addr, workers, tokenizer, served_model_name);
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -350,3 +388,57 @@ fn cmd_serve(cfg: Config, addr: &str) -> Result<()> {
         anyhow::Ok(())
     })
 }
+
+/// The real control plane: Rust frontend and router in front of engine
+/// processes. No mock engines are constructed on this path, deliberately -- a
+/// fallback to mocks when a worker is unreachable would produce a plausible
+/// number from no GPU at all.
+fn cmd_serve_real(
+    cfg: Config,
+    addr: std::net::SocketAddr,
+    workers: &[String],
+    tokenizer: Option<&std::path::Path>,
+    served_model_name: Option<String>,
+) -> Result<()> {
+    let tokenizer_path = tokenizer.context(
+        "--tokenizer is required with --worker: AIPerf sends text, the frontend \
+         tokenizes it, and the byte-level stand-in would quadruple ISL",
+    )?;
+    let tok = Arc::new(HfTokenizer::from_file(tokenizer_path)?) as Arc<dyn Tokenizer>;
+    let model_name = served_model_name.unwrap_or_else(|| cfg.model.name.clone());
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async move {
+        let deployment = Arc::new(ServingDeployment::aggregated(
+            workers,
+            model_name,
+            tok,
+            // Aggregated: prefill and decode are the same process, so the
+            // default 10 ms KV handoff term would price a transfer that never
+            // happens. It biases every prediction identically and so does not
+            // change the ranking, but a predicted TTFT that is knowably 10 ms
+            // wrong is not worth keeping.
+            RouterTuning {
+                kv_transfer_ms: 0.0,
+                ..RouterTuning::default()
+            },
+            cfg.slo.ttft_ms,
+            f64::from(cfg.kv.num_blocks.min(4096)),
+            STALE_AFTER_MS,
+        )?);
+        tracing::info!(
+            workers = workers.len(),
+            tokenizer = %tokenizer_path.display(),
+            "serving with REAL engines"
+        );
+        let state = Arc::new(AppState::new(deployment));
+        serve(state, addr).await?;
+        anyhow::Ok(())
+    })
+}
+
+/// A worker that has not been heard from for this long is not routed to. Sized
+/// well above one decode step so a busy worker is never mistaken for a dead one.
+const STALE_AFTER_MS: f64 = 5_000.0;

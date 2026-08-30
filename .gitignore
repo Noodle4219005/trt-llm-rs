@@ -11,3 +11,14 @@ logs/
 # Build trees for the from-source build (kept off the home quota)
 /build
 /third_party/**/build
+
+# Nested workspace target dirs -- /target only catches the root one, and
+# crates/dynamo/target alone is 3.4 GB.
+**/target/
+__pycache__/
+*.pyc
+
+# Fetched at build time by scripts/phase-d-protoc-bootstrap.sh, not source.
+/tools/protoc-bootstrap/
+*.orig
+*.rej

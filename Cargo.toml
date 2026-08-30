@@ -11,8 +11,10 @@ members = [
     "crates/worker",
     "crates/sim",
     "crates/tuner",
+    "crates/wire",
     "crates/cli",
     "crates/pyhost",
+    "crates/pyext",
 ]
 
 [workspace.package]
@@ -33,6 +35,7 @@ trtllm-frontend  = { path = "crates/frontend" }
 trtllm-worker    = { path = "crates/worker" }
 trtllm-sim       = { path = "crates/sim" }
 trtllm-tuner     = { path = "crates/tuner" }
+trtllm-wire      = { path = "crates/wire" }
 
 anyhow      = "1"
 thiserror   = "1"

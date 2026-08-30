@@ -101,6 +101,27 @@ pub struct ItlController {
     /// allowed to grow.
     utilisation_gate: f64,
     samples: u64,
+    /// Set once lowering the cap has demonstrably stopped reducing ITL.
+    ///
+    /// The controller's model is that ITL rises with decode concurrency. That
+    /// model is false whenever something else dominates the iteration -- a
+    /// 4000-token prefill chunk stalls every generating sequence in the same
+    /// iteration regardless of how few there are, and a model whose
+    /// single-sequence step already exceeds the budget can never reach it by
+    /// shedding load. In that regime backing off buys no latency and costs all
+    /// the throughput, which is strictly worse than not backing off at all.
+    ///
+    /// Job 314882 is what this field is for: on Qwen3-235B at ISL 4000 the cap
+    /// collapsed to min_cap = 1, refused 17k-48k admissions per worker, and
+    /// still observed ~92 ms against a 20 ms target. Goodput was 0.00.
+    concurrency_not_binding: bool,
+    ewma_at_decrease: f64,
+    observations_since_decrease: u64,
+    /// How many observations to wait after a decrease before judging whether it
+    /// helped. Long enough for the EWMA to actually move at alpha = 0.1.
+    probe_window: u64,
+    /// The decrease must buy at least this fraction of improvement to count.
+    improvement_threshold: f64,
 }
 
 impl ItlController {
@@ -118,7 +139,19 @@ impl ItlController {
             high_water: 0.98,
             utilisation_gate: 0.9,
             samples: 0,
+            concurrency_not_binding: false,
+            ewma_at_decrease: f64::INFINITY,
+            observations_since_decrease: 0,
+            probe_window: 15,
+            improvement_threshold: 0.02,
         }
+    }
+
+    /// True once the controller has established that decode concurrency is not
+    /// what is binding ITL. Reported so a run cannot quietly be interpreted as
+    /// "the policy chose this": it means the policy gave up steering.
+    pub fn concurrency_not_binding(&self) -> bool {
+        self.concurrency_not_binding
     }
 
     pub fn target_ms(&self) -> f64 {
@@ -162,13 +195,81 @@ impl ItlController {
         if self.samples < 8 {
             return;
         }
+        // Budget reachable again: whatever was dominating the iteration has
+        // gone, so resume steering. Requires the EWMA to be under the low water
+        // mark, which at alpha = 0.1 already needs a sustained change rather
+        // than one lucky iteration.
+        if self.concurrency_not_binding && self.ewma_ms < self.target_ms * self.low_water {
+            self.concurrency_not_binding = false;
+            self.ewma_at_decrease = f64::INFINITY;
+            self.observations_since_decrease = 0;
+        }
+
         if self.ewma_ms > self.target_ms * self.high_water {
+            if self.concurrency_not_binding {
+                // Backing off has been shown not to help. Hold the cap: giving
+                // up more throughput cannot buy latency that concurrency does
+                // not control.
+                return;
+            }
+            // Judging happens on a window; backing off still happens on every
+            // observation. Slowing the back-off itself would trade one failure
+            // mode for another -- a controller that reacts 15x slower to a
+            // genuine overload is not an improvement on one that over-reacts.
+            if self.ewma_at_decrease.is_infinite() {
+                self.ewma_at_decrease = self.ewma_ms;
+                self.observations_since_decrease = 0;
+            }
+            self.observations_since_decrease += 1;
+            if self.observations_since_decrease >= self.probe_window {
+                let improved =
+                    self.ewma_ms <= self.ewma_at_decrease * (1.0 - self.improvement_threshold);
+                if !improved {
+                    // A whole window of decreases bought less than
+                    // `improvement_threshold`. Concurrency is not the lever.
+                    self.give_up();
+                    return;
+                }
+                self.ewma_at_decrease = self.ewma_ms;
+                self.observations_since_decrease = 0;
+            }
             self.cap = (self.cap * self.decrease_factor).max(self.min_cap);
+
+            // The floor, still over target. This is the decisive condition and
+            // the improvement heuristic above does not catch it: while the cap
+            // falls, ITL usually does drift down a little, so every window looks
+            // like progress and the controller walks all the way to min_cap
+            // without ever reaching the target. Job 314910 did exactly that --
+            // cap 1.0 against a 20 ms target with observed ITL 95 ms, having
+            // refused 22,073 admissions to buy nothing.
+            //
+            // One sequence at a time is as low as concurrency goes. If the
+            // target is missed there, it is not concurrency that is missing it.
+            if self.cap <= self.min_cap * 1.01 {
+                self.give_up();
+            }
         } else if self.ewma_ms < self.target_ms * self.low_water
             && concurrency as f64 >= self.cap * self.utilisation_gate
         {
             self.cap = (self.cap + self.increase_step).min(self.max_cap);
+            self.ewma_at_decrease = f64::INFINITY;
+            self.observations_since_decrease = 0;
         }
+    }
+
+    /// Stop steering, and undo the throttling that bought nothing.
+    ///
+    /// Restoring the cap is the point, not a side effect. A controller that
+    /// merely stopped decreasing would sit at whatever cap it had already
+    /// collapsed to, which is the state that produced goodput 0.00. If
+    /// concurrency does not move latency, then holding concurrency down has no
+    /// benefit to trade against its cost, so the cap goes back to where
+    /// throughput is best and stays there until the budget is reachable again.
+    fn give_up(&mut self) {
+        self.concurrency_not_binding = true;
+        self.cap = self.max_cap;
+        self.ewma_at_decrease = f64::INFINITY;
+        self.observations_since_decrease = 0;
     }
 
     /// Force the cap down, e.g. because an in-flight request is about to blow
@@ -486,7 +587,11 @@ mod tests {
             c.observe(15.0, at_cap);
         }
         let hot = c.cap();
-        for _ in 0..60 {
+
+        // Within one probe window the controller has not yet had the chance to
+        // learn whether backing off helps, so it backs off -- which is the
+        // behaviour this test has always been about.
+        for _ in 0..10 {
             c.observe(26.0, 64);
         }
         assert!(
@@ -495,6 +600,127 @@ mod tests {
             c.cap()
         );
         assert!(c.cap() >= 8.0, "cap must not collapse below the floor");
+
+        // Beyond that window the latency here has not moved at all, so the
+        // controller is entitled to conclude that concurrency is not what is
+        // holding ITL above target, and to stop paying for a lever that does
+        // nothing. Feeding a constant latency is exactly the "not binding" case.
+        for _ in 0..60 {
+            c.observe(26.0, 64);
+        }
+        assert!(
+            c.concurrency_not_binding(),
+            "latency that ignores the cap means the cap is not the lever"
+        );
+    }
+
+    #[test]
+    fn the_cap_stops_falling_once_falling_stops_helping() {
+        // Qwen3-235B at ISL 4000 (job 314882): every iteration carries a 4000
+        // token prefill chunk that stalls each generating sequence, so ITL does
+        // not move with decode concurrency at all. The old controller took that
+        // to min_cap = 1, refused tens of thousands of admissions, and still
+        // missed the target -- goodput 0.00.
+        let mut c = ItlController::new(20.0, 64.0, 1.0, 256.0);
+        for _ in 0..600 {
+            c.observe(92.0, c.cap() as usize);
+        }
+        assert!(
+            c.concurrency_not_binding(),
+            "controller must notice that backing off is not buying latency"
+        );
+        assert!(
+            c.cap() > 1.0,
+            "cap must not collapse to the floor when the floor cannot meet the \
+             target either: cap = {}",
+            c.cap()
+        );
+    }
+
+    #[test]
+    fn a_cap_that_is_binding_is_still_reduced() {
+        // The escape hatch must not disarm the controller when concurrency
+        // really is what drives ITL. Here latency falls with the cap, so every
+        // decrease pays for itself and the controller must keep going.
+        let mut c = ItlController::new(20.0, 64.0, 1.0, 256.0);
+        let start = c.cap();
+        for _ in 0..600 {
+            // ITL proportional to the cap: halving the batch halves latency.
+            let itl = c.cap() * 0.5;
+            c.observe(itl, c.cap() as usize);
+        }
+        assert!(
+            !c.concurrency_not_binding(),
+            "concurrency is binding here; the controller must not give up"
+        );
+        assert!(
+            c.cap() < start,
+            "cap must fall while falling helps: {start} -> {}",
+            c.cap()
+        );
+        assert!(
+            c.observed_itl_ms() <= 20.0,
+            "the controller should have reached the target: {}",
+            c.observed_itl_ms()
+        );
+    }
+
+    #[test]
+    fn giving_up_is_reversible() {
+        // A workload phase change -- the long prefills drain -- must let the
+        // controller steer again, or one bad phase disables it for the run.
+        let mut c = ItlController::new(20.0, 64.0, 1.0, 256.0);
+        for _ in 0..600 {
+            c.observe(92.0, c.cap() as usize);
+        }
+        assert!(c.concurrency_not_binding());
+        for _ in 0..200 {
+            c.observe(5.0, c.cap() as usize);
+        }
+        assert!(
+            !c.concurrency_not_binding(),
+            "the flag must clear once the budget is reachable again"
+        );
+    }
+
+    #[test]
+    fn giving_up_restores_the_throughput_the_throttling_cost() {
+        // Not merely "stops falling": the cap must come back. Job 314910 sat at
+        // cap 1.0 having refused 22,073 admissions to buy nothing, and a fix
+        // that only froze it there would have kept every bit of that damage.
+        let mut c = ItlController::new(20.0, 128.0, 1.0, 128.0);
+        for _ in 0..400 {
+            // Latency that improves slightly as the cap falls -- enough for the
+            // per-window improvement test to keep saying "progress" -- but never
+            // reaches the target. This is the shape that walked the old
+            // controller to the floor.
+            let itl = 90.0 + c.cap() * 0.05;
+            c.observe(itl, c.cap() as usize);
+        }
+        assert!(c.concurrency_not_binding());
+        assert!(
+            c.cap() >= 128.0 * 0.99,
+            "the cap must be restored, not frozen at whatever it collapsed to: {}",
+            c.cap()
+        );
+    }
+
+    #[test]
+    fn a_single_fast_step_must_not_rearm_the_collapse() {
+        // Reproduces job 314910: the run is a mix of cheap chunked-prefill
+        // iterations and expensive ones. One dip below target*low_water cleared
+        // concurrency_not_binding, the decreases resumed, and the cap still ended
+        // at the floor.
+        let mut c = ItlController::new(20.0, 128.0, 1.0, 128.0);
+        for i in 0..2000 {
+            let step = if i % 25 == 0 { 5.0 } else { 95.0 };
+            c.observe(step, c.cap() as usize);
+        }
+        assert!(
+            c.cap() > 1.0,
+            "an occasional fast iteration must not let the cap collapse: cap = {}",
+            c.cap()
+        );
     }
 
     #[test]
