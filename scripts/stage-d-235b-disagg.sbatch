@@ -166,6 +166,46 @@ set -uo pipefail
 # never to evict, so it reserves against that window instead of the 4,200
 # tokens this workload uses. ISL 4000 + OSL 200 + margin.
 : "${MAX_SEQ_LEN:=4608}"
+
+# HOW MANY KV TRANSFERS MAY BE IN FLIGHT. Upstream's default is ONE, in each
+# direction, and it is not written as a default -- it is written as a branch:
+#
+#   baseTransBuffer.cpp:109
+#     mRecvBufferCount = getEnvRequestKVCacheConcurrent() ? getEnvKVCacheRecvBufferCount() : 1;
+#   baseTransBuffer.cpp:110
+#     mSendBufferCount = getEnvKVCacheSendMaxConcurrenceNum();
+#
+#   TRTLLM_REQUEST_KV_CACHE_CONCURRENT       envUtils.cpp:382   default false
+#   TRTLLM_KVCACHE_RECV_BUFFER_COUNT         envUtils.cpp:476   default 2, gated by the above
+#   TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM  envUtils.cpp:470   default 1
+#
+# So both pools hold one buffer, and assignBufferIndex blocks on a condition
+# variable when it is taken (baseTransBuffer.h:231-238). The whole P/D handoff
+# is one transfer at a time.
+#
+# This is what job 316849 measured without recognising it. Time to Second Token
+# -- the gap between the prefill worker's first token and the decode worker's
+# second -- was avg 181.85 ms with p50 191, p90 195, p99 208: a distribution
+# far too tight for a queue under varying load, and exactly what a fixed
+# service time looks like. 1000/181.85 = 5.50 req/s is the ceiling that implies,
+# against 4.08 req/s measured. Meanwhile AIPerf counted 73.95 requests in the
+# decode phase while the engine offered 26.3 candidates per step: the missing
+# 48 were queued behind a single buffer.
+#
+# The memory was already paid for. max_tokens_in_buffer was 65536 -- sixteen
+# 4000-token requests, about 1.5 GB per rank -- sized into a pool of one, so
+# fifteen requests' worth of buffer sat idle while fifteen requests waited.
+# One request per buffer and sixteen buffers is the same footprint and sixteen
+# times the concurrency. 4096 rather than 4000 because
+# computeTransferBufferSize asserts maxNumTokens % tokensPerBlock == 0
+# (cacheTransBuffer.cpp:212) and tokensPerBlock is 32.
+#
+# vLLM makes the opposite choice by construction: its connector reports
+# completion as a SET of request ids (get_finished) and its scheduler tracks
+# finished_recving_kv_req_ids as a set, so many transfers in flight is the
+# normal case and there is no single buffer to serialise on.
+: "${KV_XFER_CONCURRENCY:=16}"
+: "${MAX_TOKENS_IN_BUFFER:=4096}"
 # CUDA graphs are configured through --extra-engine-args, NOT through
 # --enable-cuda-graph. That flag exists on `dynamo.trtllm`, is accepted, and is
 # wired only into the diffusion engine: `grep -c enable_cuda_graph` over the LLM
@@ -246,9 +286,16 @@ cache_transceiver_config:
   #
   # Sizing: Qwen3-235B at TP4 holds 1 KV head per rank, so
   # 94 layers x 1 head x 128 dim x 2 (K+V) x 1 byte FP8 = ~24 KB per token per
-  # rank. 65536 tokens = ~1.5 GB per rank, which is affordable and holds ~16
-  # concurrent 4000-token requests in flight.
-  max_tokens_in_buffer: ${MAX_TOKENS_IN_BUFFER:-65536}
+  # rank.
+  #
+  # This used to read 65536 with the note "holds ~16 concurrent 4000-token
+  # requests in flight". That was wrong, and wrong in the direction that hides
+  # itself: it sizes ONE buffer, and the pool holds one buffer unless
+  # TRTLLM_REQUEST_KV_CACHE_CONCURRENT is set (baseTransBuffer.cpp:109). So the
+  # 1.5 GB per rank bought room for sixteen requests and served exactly one,
+  # while the other fifteen blocked on a condition variable. One request per
+  # buffer, sixteen buffers, same footprint -- see KV_XFER_CONCURRENCY above.
+  max_tokens_in_buffer: ${MAX_TOKENS_IN_BUFFER}
 YAML
 echo "  engine.yaml:"; sed 's/^/    /' "$OUT/engine.yaml"
 
@@ -391,6 +438,9 @@ launch_worker () {
     --env "PYTHONPATH=$STAGE" \
     --env "TRTLLM_RS_SHADOW=1" --env "TRTLLM_RS_LIVE=1" \
     --env "TRTLLM_RS_MMAP_WEIGHTS=1" \
+    --env "TRTLLM_REQUEST_KV_CACHE_CONCURRENT=1" \
+    --env "TRTLLM_KVCACHE_RECV_BUFFER_COUNT=${KV_XFER_CONCURRENCY}" \
+    --env "TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM=${KV_XFER_CONCURRENCY}" \
     --env "TRTLLM_RS_SHADOW_OUT=$OUT/bridge-$tag" \
     --env "TRTLLM_RS_ITL_BUDGET_MS=20.0" \
     --env "DYN_FILE_KV=$DYN_FILE_KV" \
