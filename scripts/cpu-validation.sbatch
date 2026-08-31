@@ -25,6 +25,11 @@ command -v apptainer >/dev/null || { echo "!!! no apptainer here"; exit 30; }
 apptainer exec --bind /work/u5727520,/home/u5727520,$HOME/.cargo,$HOME/.rustup "$SIF" \
   bash -lc "cd $SRC && export CARGO_TARGET_DIR=$TARGET CARGO_BUILD_JOBS=\$(nproc) \
     RUSTFLAGS='--cfg tokio_unstable' && \
+    echo '--- fmt ---' && cargo fmt --all --check 2>&1 | head -20 && \
+    echo '--- clippy ---' && \
+    cargo clippy --workspace --exclude trtllm-pyhost --exclude trtllm-pyext \
+      --all-targets 2>&1 | grep -E '^(warning|error)' | head -20 && \
+    echo '--- test ---' && \
     cargo test --workspace --exclude trtllm-pyhost --exclude trtllm-pyext \
       --all-targets --no-fail-fast 2>&1 | tail -200 && \
     echo && echo '========== plan ==========' && \

@@ -15,10 +15,9 @@ use std::path::PathBuf;
 use trtllm_core::config::Config;
 
 fn launcher() -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../scripts/stage-d-235b-disagg.sbatch");
-    fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/stage-d-235b-disagg.sbatch");
+    fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
 }
 
 /// Pull `: "${NAME:=value}"` out of the script.
@@ -47,11 +46,31 @@ fn the_launcher_and_the_default_config_describe_one_deployment() {
     let c = Config::default();
 
     let pairs: [(&str, f64, f64); 6] = [
-        ("PREFILL_WORKERS", number(&s, "PREFILL_WORKERS"), c.topology.prefill_workers.into()),
-        ("PREFILL_TP", number(&s, "PREFILL_TP"), c.topology.prefill_tp.into()),
-        ("DECODE_WORKERS", number(&s, "DECODE_WORKERS"), c.topology.decode_workers.into()),
-        ("DECODE_TP", number(&s, "DECODE_TP"), c.topology.decode_tp.into()),
-        ("KV_XFER_CONCURRENCY", number(&s, "KV_XFER_CONCURRENCY"), c.kv.xfer_concurrency.into()),
+        (
+            "PREFILL_WORKERS",
+            number(&s, "PREFILL_WORKERS"),
+            c.topology.prefill_workers.into(),
+        ),
+        (
+            "PREFILL_TP",
+            number(&s, "PREFILL_TP"),
+            c.topology.prefill_tp.into(),
+        ),
+        (
+            "DECODE_WORKERS",
+            number(&s, "DECODE_WORKERS"),
+            c.topology.decode_workers.into(),
+        ),
+        (
+            "DECODE_TP",
+            number(&s, "DECODE_TP"),
+            c.topology.decode_tp.into(),
+        ),
+        (
+            "KV_XFER_CONCURRENCY",
+            number(&s, "KV_XFER_CONCURRENCY"),
+            c.kv.xfer_concurrency.into(),
+        ),
         ("N", number(&s, "N"), c.workload.concurrency.into()),
     ];
     for (name, launcher_value, config_value) in pairs {

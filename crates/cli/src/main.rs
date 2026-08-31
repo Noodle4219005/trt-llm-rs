@@ -212,8 +212,17 @@ fn cmd_plan(cfg: &Config, total_gpus: u32, prefill_tp: &[u32], decode_tp: &[u32]
     println!();
     println!(
         "{:>5} {:>5} {:>7} {:>7} {:>9} {:>12} {:>11} {:>10} {:>10} {:<11} {:>8}",
-        "P gpu", "D gpu", "P tp", "D tp", "P workers", "prefill r/s", "decode r/s",
-        "xfer r/s", "goodput", "binds on", "headroom"
+        "P gpu",
+        "D gpu",
+        "P tp",
+        "D tp",
+        "P workers",
+        "prefill r/s",
+        "decode r/s",
+        "xfer r/s",
+        "goodput",
+        "binds on",
+        "headroom"
     );
     for s in model
         .search(total_gpus, prefill_tp, decode_tp)
@@ -235,6 +244,46 @@ fn cmd_plan(cfg: &Config, total_gpus: u32, prefill_tp: &[u32], decode_tp: &[u32]
             s.headroom_ratio
         );
     }
+    // What to do about the constraint the best split reports. Naming a
+    // bottleneck without naming a knob leaves the reader to guess, and the
+    // guesses in this project have gone to the wrong lever more than once.
+    if let Some(best) = model
+        .search(total_gpus, prefill_tp, decode_tp)
+        .into_iter()
+        .next()
+    {
+        println!();
+        let remedies = model.remedies(&best);
+        if remedies.is_empty() {
+            println!(
+                "Best split binds on {:?}, and every remedy this model knows \
+                 is already applied.",
+                best.bottleneck
+            );
+        } else {
+            println!(
+                "Best split binds on {:?}. Ordered by how well each is backed, \
+                 not by size:",
+                best.bottleneck
+            );
+        }
+        for r in remedies {
+            let mult = if (r.multiplier - 1.0).abs() < 1e-9 {
+                "unblocks".to_string()
+            } else {
+                format!("{:.2}x", r.multiplier)
+            };
+            println!(
+                "  {:<12} {:>9}  {}={}",
+                r.evidence.label(),
+                mult,
+                r.knob,
+                r.setting
+            );
+            println!("               {}", r.because);
+        }
+    }
+
     println!();
     println!(
         "Note: the decode column extrapolates an ITL-versus-concurrency curve fitted to ONE \n\

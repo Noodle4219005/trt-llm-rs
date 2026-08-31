@@ -524,8 +524,16 @@ mod tests {
     #[test]
     fn a_topology_that_cannot_load_is_not_offered() {
         let m = CapacityModel::default();
-        assert!(!m.fits_in_memory(2), "TP2 leaves {:.1} GiB", m.free_gib_per_rank(2));
-        assert!(m.fits_in_memory(4), "TP4 leaves {:.1} GiB", m.free_gib_per_rank(4));
+        assert!(
+            !m.fits_in_memory(2),
+            "TP2 leaves {:.1} GiB",
+            m.free_gib_per_rank(2)
+        );
+        assert!(
+            m.fits_in_memory(4),
+            "TP4 leaves {:.1} GiB",
+            m.free_gib_per_rank(4)
+        );
         assert!(m.fits_in_memory(8));
 
         let splits = m.search(16, &[2, 4, 8], &[4, 8]);
@@ -741,7 +749,8 @@ mod tests {
             .next()
             .expect("a topology");
         assert_eq!(
-            best.prefill_tp, 4,
+            best.prefill_tp,
+            4,
             "TP2 prefill was recommended again; it leaves {:.1} GiB per rank \
              against a {:.1} GiB requirement",
             m.free_gib_per_rank(2),

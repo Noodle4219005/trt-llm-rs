@@ -49,7 +49,6 @@ impl Tokenizer for SyntheticTokenizer {
     }
 }
 
-
 /// The model's own tokenizer, loaded from a HuggingFace `tokenizer.json`.
 ///
 /// Same crate and feature set as the pinned Dynamo tree uses

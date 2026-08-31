@@ -13,6 +13,7 @@ pub mod capacity;
 pub mod config;
 pub mod error;
 pub mod ids;
+pub mod remedy;
 pub mod request;
 pub mod slo;
 pub mod stats;
