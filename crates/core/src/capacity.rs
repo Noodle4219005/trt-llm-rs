@@ -613,8 +613,10 @@ mod tests {
     /// deployment was measured at 4.08 req/s with nothing saturated.
     #[test]
     fn the_model_names_the_handoff_when_it_is_the_constraint() {
-        let mut m = CapacityModel::default();
-        m.xfer_concurrency = 1;
+        let m = CapacityModel {
+            xfer_concurrency: 1,
+            ..CapacityModel::default()
+        };
         let s = m.evaluate(8, 8, 4, 8);
 
         assert_eq!(

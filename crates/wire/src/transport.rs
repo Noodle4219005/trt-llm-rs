@@ -229,7 +229,7 @@ fn parse_sse_frame(frame: &[u8]) -> Result<Option<SseEvent>, TransportError> {
         .map_err(|error| TransportError::new(format!("invalid UTF-8 SSE frame: {error}")))?;
     let mut event = None;
     let mut data = Vec::new();
-    for line in frame.split(|character| character == '\r' || character == '\n') {
+    for line in frame.split(['\r', '\n']) {
         if line.starts_with(':') || line.is_empty() {
             continue;
         }

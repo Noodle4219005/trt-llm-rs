@@ -297,6 +297,35 @@ set -uo pipefail
 # ourselves on this stack rather than inheriting it from SGLang's.
 : "${EXPERT_PARALLEL:=1}"
 
+# CONTEXT PARALLELISM. Off, and the arithmetic says it should not be.
+#
+# TTFT is the gate that binds at the best configuration anyone has measured:
+# SGLang job 302350 had ITL p99 19.09 inside a 20 ms budget and TTFT p95 3526
+# against 3000, failing ~7%. TTFT there is dominated by the prefill forward
+# pass, 1.6-2.1 s for 4000 tokens. Context parallelism splits the sequence
+# rather than the weights, so it attacks that number directly -- it lowers
+# prefill LATENCY, which is the quantity the gate is written in, rather than
+# throughput.
+#
+#   Ulysses CP2 costs two all-to-alls per layer: 4000 x 4096 x 2 B = 33 MB
+#   each, x 2 x 94 layers = 6.2 GB per request. Over intra-node NVLink P2P
+#   that is 31-123 ms depending on achieved bandwidth, against 800-1050 ms
+#   saved by halving a 1.6-2.1 s forward. Roughly 8x net at the pessimistic end.
+#
+# MEMORY: CP does NOT shard weights. TP4 x CP2 needs 8 GPUs per prefill worker
+# and leaves 76 GiB per rank, which is fine; TP2 x CP2 on 4 GPUs leaves 21 GiB
+# and is the configuration already measured unrunnable.
+#
+# WHY IT IS STILL OFF: every mention of CP in TensorRT-LLM's docs is helix
+# (million-token DECODE with KV sharding) or video generation. Qwen3Attention
+# carries cp_size awareness (modeling_qwen3.py:138) and the MoE variant imports
+# it, so the path exists, but nothing in this version documents Ulysses CP for
+# a 4000-token prefill. The arithmetic is a reason to test it, not evidence
+# that it works.
+#
+# CONTEXT_PARALLEL=2 with PREFILL_WORKERS=1 and PREFILL_TP=4 is the shape to try.
+: "${CONTEXT_PARALLEL:=1}"
+
 # Off upstream, and left off deliberately. Chunked prefill exists to interleave
 # a long prompt with decode work in the same iteration, and a disaggregated
 # prefill worker has no decode work to interleave with. At ISL 4000 against
@@ -375,6 +404,9 @@ write_engine_yaml () {
   local path="$1" role="$2"
   {
     echo "attn_backend: ${ATTN_BACKEND}"
+    if [ "${CONTEXT_PARALLEL}" != 1 ]; then
+      echo "context_parallel_size: ${CONTEXT_PARALLEL}"
+    fi
     echo "allreduce_strategy: ${ALLREDUCE_STRATEGY}"
     echo "enable_chunked_prefill: ${CHUNKED_PREFILL_BOOL}"
     echo "moe_config:"
@@ -762,7 +794,7 @@ for w in $(seq 0 $((DECODE_WORKERS - 1))); do
   fi
 done
 for w in $(seq 0 $((PREFILL_WORKERS - 1))); do
-  g=$(( PREFILL_TP * PREFILL_PP ))
+  g=$(( PREFILL_TP * PREFILL_PP * CONTEXT_PARALLEL ))
   launch_worker prefill "$NODE_P" "p$w" "$PREFILL_TP" "$(seq -s, $((w * g)) $((w * g + g - 1)))" "$PREFILL_PP"
 done
 for w in $(seq 0 $((DECODE_WORKERS - 1))); do await_worker "d$w"; done

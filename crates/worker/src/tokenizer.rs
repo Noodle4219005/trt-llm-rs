@@ -49,18 +49,6 @@ impl Tokenizer for SyntheticTokenizer {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ascii_round_trips_and_keeps_its_length() {
-        let t = SyntheticTokenizer;
-        let ids = t.encode("hello");
-        assert_eq!(ids.len(), 5);
-        assert_eq!(t.decode(&ids), "hello");
-    }
-}
 
 /// The model's own tokenizer, loaded from a HuggingFace `tokenizer.json`.
 ///
@@ -109,5 +97,18 @@ impl Tokenizer for HfTokenizer {
 
     fn name(&self) -> String {
         self.name.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ascii_round_trips_and_keeps_its_length() {
+        let t = SyntheticTokenizer;
+        let ids = t.encode("hello");
+        assert_eq!(ids.len(), 5);
+        assert_eq!(t.decode(&ids), "hello");
     }
 }
