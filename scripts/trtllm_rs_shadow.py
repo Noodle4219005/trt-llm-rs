@@ -121,7 +121,30 @@ class ShadowState:
         # holds the matching pool, without naming it again at every call.
         self.advancing_itl_count = [0]
         self.steer_itl_count = [0]
+        # Departures, split. `stranded` is a request that stopped being offered
+        # to the scheduler before producing the tokens it asked for; `completed`
+        # is one that finished. Both used to be silent.
+        self.completed = 0
+        self.stranded = 0
+        self.stranded_tokens_short = 0
         self.reason_first_error = ""
+
+    def retire_departed(self, live_ids: set) -> None:
+        """Book every request that stopped being offered, split by why.
+
+        A request that finished its budget and one that vanished mid-generation
+        both simply stop appearing in the candidate list. Counting them apart is
+        the only way the second kind is visible at all: DecideInput is entirely
+        per-step, so the scheduler cannot notice that something it admitted 200
+        steps ago is gone.
+        """
+        for gone in [r for r in self.token_progress if r not in live_ids]:
+            _, produced, wanted = self.token_progress.pop(gone)
+            if wanted and produced < wanted:
+                self.stranded += 1
+                self.stranded_tokens_short += wanted - produced
+            else:
+                self.completed += 1
 
     def reservoir(
         self,
@@ -176,6 +199,9 @@ class ShadowState:
             "steer_itl_p50": _pct(self.steer_itl, 0.50),
             "steer_itl_p90": _pct(self.steer_itl, 0.90),
             "steer_itl_p99": _pct(self.steer_itl, 0.99),
+            "completed": self.completed,
+            "stranded": self.stranded,
+            "stranded_tokens_short": self.stranded_tokens_short,
             "steer_itl_seen": self.steer_itl_count[0],
             # Interval between tokens of sequences the engine IS advancing.
             # Says how fast the engine is, NOT how long requests wait -- the
@@ -369,20 +395,45 @@ def install() -> bool:
                 generating += 1
                 STATE.generating_seen += 1
                 produced = generated[i]
+                wanted = max_new[i]
                 previous = STATE.token_progress.get(rid)
                 if previous is not None:
-                    prev_ms, prev_tokens = previous
+                    prev_ms, prev_tokens, _ = previous
                     advanced = produced - prev_tokens
                     if advanced > 0:
                         sample = (now_ms - prev_ms) / advanced
                         itl_samples.append(sample)
                         STATE.advanced_seen += 1
                         STATE.reservoir(STATE.advancing_itl, STATE.advancing_itl_count, sample)
-                        STATE.token_progress[rid] = (now_ms, produced)
+                        STATE.token_progress[rid] = (now_ms, produced, wanted)
                 else:
-                    STATE.token_progress[rid] = (now_ms, produced)
+                    STATE.token_progress[rid] = (now_ms, produced, wanted)
+
+            # A request leaving the candidate list is TWO different events and
+            # this loop used to treat them as one.
+            #
+            # Job 316849: AIPerf reported 73.95 requests in the decode phase
+            # while the engine offered 26.3 candidates per step. Forty-eight
+            # requests were in decode, invisible to everything we own, for about
+            # fourteen seconds each -- and the evidence passed through this exact
+            # line every step and was dropped, because a request that finished
+            # its 200 tokens and a request that vanished at token 3 both simply
+            # stopped appearing in `live_ids`.
+            #
+            # The scheduler cannot see this on its own: DecideInput is entirely
+            # per-step, so "a request I admitted 200 steps ago is no longer being
+            # offered" is not an observation it can make. vLLM's V1 scheduler
+            # owns `running` and emits a per-request token count every step, so
+            # the state we spent a 16-GPU run failing to detect is one its design
+            # cannot express. This is the cheap half of that discipline: keep the
+            # ledger, and count the two departures apart.
             for gone in [r for r in STATE.token_progress if r not in live_ids]:
-                STATE.token_progress.pop(gone, None)
+                _, produced_at_exit, wanted_at_exit = STATE.token_progress.pop(gone)
+                if wanted_at_exit and produced_at_exit < wanted_at_exit:
+                    STATE.stranded += 1
+                    STATE.stranded_tokens_short += wanted_at_exit - produced_at_exit
+                else:
+                    STATE.completed += 1
 
             # What the controller steers on. NOT the mean of the samples above.
             #

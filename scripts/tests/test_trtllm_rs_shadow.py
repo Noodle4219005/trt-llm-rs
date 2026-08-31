@@ -68,3 +68,43 @@ class ShadowSamplingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DepartureLedgerTests(unittest.TestCase):
+    """A request leaving the candidate list is two different events.
+
+    Job 316849 measured 73.95 requests in the decode phase against 26.3
+    candidates offered per step. The forty-eight missing ones passed through
+    the pruning loop every step and were dropped, because a request that
+    finished its 200 tokens and one that vanished at token 3 both simply
+    stopped appearing.
+    """
+
+    def test_a_request_that_finished_is_completed(self):
+        state = shadow.ShadowState()
+        state.token_progress[7] = (0.0, 200, 200)
+        state.retire_departed(set())
+        self.assertEqual((state.completed, state.stranded), (1, 0))
+
+    def test_a_request_that_vanished_early_is_stranded(self):
+        state = shadow.ShadowState()
+        state.token_progress[7] = (0.0, 3, 200)
+        state.retire_departed(set())
+        self.assertEqual((state.completed, state.stranded), (0, 1))
+        self.assertEqual(state.stranded_tokens_short, 197)
+
+    def test_a_request_still_being_offered_is_not_retired(self):
+        state = shadow.ShadowState()
+        state.token_progress[7] = (0.0, 3, 200)
+        state.retire_departed({7})
+        self.assertEqual((state.completed, state.stranded), (0, 0))
+        self.assertIn(7, state.token_progress)
+
+    def test_an_unknown_budget_is_not_counted_as_stranded(self):
+        """max_new can come back 0 from a request object that does not expose
+        it; guessing "stranded" there would invent the very number this exists
+        to measure."""
+        state = shadow.ShadowState()
+        state.token_progress[7] = (0.0, 3, 0)
+        state.retire_departed(set())
+        self.assertEqual((state.completed, state.stranded), (1, 0))
