@@ -326,6 +326,35 @@ set -uo pipefail
 # CONTEXT_PARALLEL=2 with PREFILL_WORKERS=1 and PREFILL_TP=4 is the shape to try.
 : "${CONTEXT_PARALLEL:=1}"
 
+# ---------------------------------------------------------------------------
+# ONE KNOB PER MFU LOSS TERM. `plan` reports where the tensor cores go; these
+# are what can be done about each line of it.
+#
+#   9.0% of wall time outside the forward pass   1.10x   HOST_DISPATCH_SPIN
+#  25.0% of kernel time in the TP all-reduce     1.33x   ALLREDUCE_STRATEGY (above)
+#  the rest runs at 25.3% MFU                    1.97x   TORCH_COMPILE
+#
+# enable_low_latency_host_dispatch: "Use low-latency spin-wait mode for CUDA
+# host task dispatch (cudaLaunchHostFunc_v2 with cudaHostTaskSpinWait). Reduces
+# callback latency at the cost of a CPU core spinning while waiting." We
+# allocate 96 CPUs per node and use a handful, so the cost is free here and the
+# benefit lands exactly on the duty-cycle term.
+: "${HOST_DISPATCH_SPIN:=0}"
+
+# torch.compile. Off upstream, and the sub-options say why it is worth trying
+# against the compute-MFU term rather than the others:
+#   enable_fullgraph            True   (default when compile is on)
+#   enable_inductor             False  <- the codegen that would change the GEMMs
+#   enable_piecewise_cuda_graph False
+#   enable_userbuffers          True   (same mechanism as ALLREDUCE_STRATEGY=UB)
+#   max_num_streams             1      <- no overlap of independent work
+#
+# TORCH_COMPILE=1 enables it with upstream's defaults; TORCH_COMPILE=inductor
+# additionally turns on the inductor backend, which is the one aimed at the
+# 25.3%. Compilation costs startup time, which this benchmark charges to TTFT
+# on the first requests, so a win has to be big enough to pay that back.
+: "${TORCH_COMPILE:=0}"
+
 # Off upstream, and left off deliberately. Chunked prefill exists to interleave
 # a long prompt with decode work in the same iteration, and a disaggregated
 # prefill worker has no decode work to interleave with. At ISL 4000 against
@@ -407,6 +436,19 @@ write_engine_yaml () {
     if [ "${CONTEXT_PARALLEL}" != 1 ]; then
       echo "context_parallel_size: ${CONTEXT_PARALLEL}"
     fi
+    if [ "${HOST_DISPATCH_SPIN}" = 1 ]; then
+      echo "enable_low_latency_host_dispatch: true"
+    fi
+    case "${TORCH_COMPILE}" in
+      0) ;;
+      inductor)
+        echo "torch_compile_config:"
+        echo "  enable_inductor: true"
+        ;;
+      *)
+        echo "torch_compile_config: {}"
+        ;;
+    esac
     echo "allreduce_strategy: ${ALLREDUCE_STRATEGY}"
     echo "enable_chunked_prefill: ${CHUNKED_PREFILL_BOOL}"
     echo "moe_config:"

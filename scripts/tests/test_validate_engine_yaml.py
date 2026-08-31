@@ -104,3 +104,16 @@ cache_transceiver_config:
         for s in ("AUTO", "NCCL", "UB", "MINLATENCY", "ONESHOT", "TWOSHOT",
                   "LOWPRECISION", "MNNVL", "NCCL_SYMMETRIC"):
             self.assertEqual(problems(f"allreduce_strategy: {s}"), [], s)
+
+    def test_every_mfu_knob_validates(self):
+        """One knob per line of the MFU decomposition; all must reach the
+        engine, since a knob that is silently ignored is the failure this file
+        exists to prevent."""
+        for body in (
+            "enable_low_latency_host_dispatch: true",
+            "torch_compile_config: {}",
+            "torch_compile_config:\n  enable_inductor: true",
+            "context_parallel_size: 2",
+            "allreduce_strategy: LOWPRECISION",
+        ):
+            self.assertEqual(problems(body), [], body)
