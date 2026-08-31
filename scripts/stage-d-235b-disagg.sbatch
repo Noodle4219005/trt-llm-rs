@@ -451,7 +451,12 @@ srun -N1 -n1 -w "$NODE_A" --overlap apptainer exec --nv $BIND \
   "$SIF" bash -euo pipefail -c '
     export PATH="$HOME/.cargo/bin:$PATH"; cd "$SRC"
     cargo build --release -p trtllm-pyext
-    cp "$CARGO_TARGET_DIR/release/libtrtllm_pyext.so" "$STAGE/trtllm_rs.so"' || exit 20
+    cp "$CARGO_TARGET_DIR/release/libtrtllm_pyext.so" "$STAGE/trtllm_rs.so"
+    # The planner too, so this run records what was predicted for it before it
+    # produces what actually happened. Six jobs were interpreted against a model
+    # that had never been printed next to a result.
+    cargo build --release -p trtllm-cli
+    cp "$CARGO_TARGET_DIR/release/trt-llm-rs" "$STAGE/trt-llm-rs"' || exit 20
 cp "$SRC/scripts/nccl_preflight.py" \
    "$SRC/scripts/usercustomize.py" "$SRC/scripts/trtllm_rs_shadow.py" \
    "$SRC/scripts/trtllm_rs_mmap_weights.py" "$STAGE/"
@@ -706,6 +711,14 @@ NODE_P="${NODES[0]}"; NODE_D="${NODES[1]}"
 # (d0 at 108 s, p0-p3 at 138/6/12/6 s, no host OOM anywhere). They are on
 # different nodes, so the only thing serialising them bought after that was
 # 108 s of wall clock, which at 16 GPUs is ~29 SU.
+echo; echo "########## what the model predicts for this run ##########"
+# Printed BEFORE the workers start, so it cannot be written after seeing the
+# answer. If the measured goodput and this disagree, one of them is wrong and
+# the run has told us which question to ask.
+srun -N1 -n1 -w "$NODE_A" --overlap apptainer exec $BIND "$SIF" \
+  "$STAGE/trt-llm-rs" plan --total-gpus "$(( PREFILL_WORKERS * PREFILL_TP + DECODE_WORKERS * DECODE_TP ))" \
+  2>&1 | head -18 | sed 's/^/  /' || echo "  (planner unavailable; continuing)"
+
 echo; echo "########## engine.yaml validation ##########"
 srun -N1 -n1 -w "$NODE_P" --overlap apptainer exec $BIND "$SIF" \
   bash -c 'for f in "$0"/engine-*.yaml; do python3 "$1" "$f" || exit 28; done' \
