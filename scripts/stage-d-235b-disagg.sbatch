@@ -220,15 +220,31 @@ set -uo pipefail
 #   moe_config.backend  AUTO (default) | CUTLASS | CUTEDSL | WIDEEP | TRTLLM |
 #                       DEEPGEMM | DENSEGEMM | VANILLA | TRITON | MARLIN |
 #                       MEGAMOE_DEEPGEMM                     llm_args.py MoeConfig
+#
+#   AUTO IS CUTLASS HERE, and that is worth knowing before reading a result as
+#   "the default". model_config.py:363-369 returns TRTLLM only for
+#   fp8_block_scales on SM100 (Blackwell); an H200 is SM90, so the branch cannot
+#   fire and it falls through to CUTLASS.
+#
+#   DEEPGEMM is available and was gated by mistake until 2026-09-01. It does
+#   NOT need the PyPI `deep_gemm`: fused_moe_deepgemm.py imports
+#   `from tensorrt_llm import deep_gemm`, a bundled module, and every symbol
+#   that path uses is present. SGLang's SOTA run set its own MoE backend to
+#   deep_gemm explicitly -- suggestive, but a DIFFERENT implementation, so it
+#   is a reason to try DEEPGEMM here, not evidence about it. The EP1 finding
+#   above is mechanism-level and does transfer; this one is not.
 #   transceiver backend DEFAULT | UCX | NIXL | MOONCAKE | MPI  llm_args.py:3836
 #
 # WHAT IS ACTUALLY IMPORTABLE IN THIS CONTAINER, checked, not assumed:
 #   flashinfer  yes      nixl  yes      kvbm  yes
-#   deep_gemm   NO       deep_ep  NO    mooncake  NO      lmcache  NO
-# So DEEPGEMM and MEGAMOE_DEEPGEMM will fail at import, MOONCAKE has no library
-# behind it, and the kv_connector registry's lmcache entries point at a module
-# that is not here (connectors/registry.py:23-31). kvbm is the one connector
-# that could be switched on today.
+#   tensorrt_llm.deep_gemm  yes          deep_ep  NO
+#   mooncake    NO       lmcache  NO
+# So WIDEEP fails at import (fused_moe_wide_ep.py wants deep_ep), MOONCAKE has
+# no library behind it, and the kv_connector registry's lmcache entries point
+# at a module that is not here (connectors/registry.py:23-31). kvbm is the one
+# connector that could be switched on today, and it is the wrong one to switch
+# on: its API is get_num_new_matched_tokens plus offload filtering, and
+# --cache-bust first_turn_prefix makes the first return zero.
 #
 # Qwen3-235B-A22B is a MoE model, so moe_config.backend is the larger operator
 # lever of the two; attn_backend is the one with a working alternative
@@ -254,25 +270,32 @@ set -uo pipefail
 # enable_min_latency is documented "Currently only used for Llama4".
 : "${ALLREDUCE_STRATEGY:=AUTO}"
 
-# EXPERT PARALLELISM, and the default here disagrees with our own strongest
-# measurement. Read this before running.
+# EXPERT PARALLELISM. EP1, and two independent sources say so.
 #
-# The script passes --expert-parallel-size $tp, so EP == TP == 4, which is what
-# the user specified and what AIConfigurator recommends. But this wiki already
-# measured the alternative on the same model and hardware: SGLang job 302350
-# reached goodput 14.35 at gf 0.932 with EP1 on both sides -- dropping the
-# per-token all-to-all -- against the EP4 configuration, and recorded the
-# difference as +43%. It also set the MoE backend explicitly rather than
-# leaving it on auto.
+# This script passed --expert-parallel-size $tp, so EP4, until both of these
+# turned up:
 #
-# EP1 with TP4 does not mean replicating 128 experts per rank. It means the
-# expert weights are TP-sharded instead of EP-sharded: same memory, an
-# all-reduce in place of an all-to-all. TensorRT-LLM expresses that through
-# moe_tensor_parallel_size / moe_expert_parallel_size.
+# 1. Our own measurement. SGLang job 302350 on the same model and hardware
+#    reached goodput 14.35 at gf 0.932 with EP1 on both sides -- dropping the
+#    per-token all-to-all -- and the note records the difference from EP4 as
+#    +43%. It has been in this wiki since 2026-08-26.
 #
-# Left at TP because that is what was asked for, and flagged rather than
-# flipped: EXPERT_PARALLEL=1 is a one-variable test of a 43% claim.
-: "${EXPERT_PARALLEL:=0}"   # 0 = follow TP; otherwise an explicit EP size
+# 2. TensorRT-LLM's own default. mapping.py:112-114:
+#
+#        if moe_tp_size == -1 and moe_ep_size == -1:
+#            moe_tp_size = moe_world_size // moe_cluster_size
+#            moe_ep_size = 1
+#
+#    Passing nothing gives TP-sharded MoE at EP1. Passing --expert-parallel-size 4
+#    sets moe_ep_size = 4, and moe_tp_size then falls out as
+#    moe_world_size // (4 * 1) = 1: pure expert parallelism with no MoE tensor
+#    parallelism at all. We were overriding the default to reach the slower one.
+#
+# EP1 with TP4 does not replicate 128 experts per rank. The expert weights are
+# TP-sharded rather than EP-sharded: same memory, an all-reduce instead of an
+# all-to-all. Set EXPERT_PARALLEL=4 to go back and measure the 43% for
+# ourselves on this stack rather than inheriting it from SGLang's.
+: "${EXPERT_PARALLEL:=1}"
 
 # Off upstream, and left off deliberately. Chunked prefill exists to interleave
 # a long prompt with decode work in the same iteration, and a disaggregated
@@ -538,7 +561,8 @@ await_free_gpus () {
 declare -A WPID
 
 launch_worker () {
-  local role="$1" node="$2" tag="$3" tp="$4" gpus="${5:-}" pp="${6:-1}" kvfrac adp=() ep
+  local role="$1" node="$2" tag="$3" tp="$4" gpus="${5:-}" pp="${6:-1}" kvfrac adp=()
+  local ep="${EXPERT_PARALLEL}"
   # 220.2 GiB of FP8 weights over TP2 is 110.1 GiB on a 131 GiB card, leaving
   # ~21 GiB; asking for 80% of that on top of activations is what killed all
   # four prefill workers in 316051 and 316287. A prefill worker computes KV and

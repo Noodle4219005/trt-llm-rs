@@ -53,9 +53,17 @@ cache_transceiver_config:
         self.assertIn("FLASHINFER", found[0])
 
     def test_a_backend_whose_library_is_absent_is_rejected(self):
-        found = problems("moe_config:\n  backend: DEEPGEMM")
+        """WIDEEP genuinely needs deep_ep, which is not in this container."""
+        found = problems("moe_config:\n  backend: WIDEEP")
         self.assertTrue(found)
-        self.assertIn("deep_gemm", found[0])
+        self.assertIn("deep_ep", found[0])
+
+    def test_deepgemm_is_available_and_must_not_be_gated(self):
+        """DEEPGEMM does not need the PyPI deep_gemm. TensorRT-LLM bundles
+        tensorrt_llm.deep_gemm, which fused_moe_deepgemm.py imports and which
+        is present here. Gating on the top-level name rejected a backend that
+        works."""
+        self.assertEqual(problems("moe_config:\n  backend: DEEPGEMM"), [])
 
     def test_a_backend_whose_library_is_present_is_accepted(self):
         self.assertEqual(problems("attn_backend: FLASHINFER"), [])

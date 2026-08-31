@@ -30,9 +30,16 @@ ALLOWED = {
 }
 
 # Choices that type-check and then fail at import.
+#
+# The module names matter and one of them was wrong here: DEEPGEMM does NOT
+# need the PyPI `deep_gemm` package. TensorRT-LLM bundles its own
+# `tensorrt_llm.deep_gemm`, which is what fused_moe_deepgemm.py imports, and it
+# is present with every symbol that path uses. Gating on the top-level name
+# rejected a backend that works -- the same class of error as reading a
+# declared default instead of the branch that consumes it.
 GATED = {
-    ("moe_config", "backend", "DEEPGEMM"): "deep_gemm",
-    ("moe_config", "backend", "MEGAMOE_DEEPGEMM"): "deep_gemm",
+    ("moe_config", "backend", "DEEPGEMM"): "tensorrt_llm.deep_gemm",
+    ("moe_config", "backend", "MEGAMOE_DEEPGEMM"): "tensorrt_llm.deep_gemm",
     ("moe_config", "backend", "WIDEEP"): "deep_ep",
     ("cache_transceiver_config", "backend", "MOONCAKE"): "mooncake",
     ("attn_backend", None, "FLASHINFER"): "flashinfer",
