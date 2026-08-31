@@ -205,6 +205,37 @@ set -uo pipefail
 # finished_recving_kv_req_ids as a set, so many transfers in flight is the
 # normal case and there is no single buffer to serialise on.
 : "${KV_XFER_CONCURRENCY:=16}"
+
+# ---------------------------------------------------------------------------
+# BACKEND A/B SURFACE. One variable per swappable implementation, so a
+# comparison is "this stack with backend X against the same stack with backend
+# Y" and never "framework A against library B" -- the operator layer only
+# admits the first kind of claim.
+#
+# Values are the Literals TensorRT-LLM v1.3.0rc22 actually accepts, read from
+# the source rather than from a compatibility table:
+#
+#   attn_backend        TRTLLM (default) | FLASHINFER | TRITON | VANILLA
+#                       attention_backend/{trtllm,flashinfer,triton_prefill,vanilla}.py
+#   moe_config.backend  AUTO (default) | CUTLASS | CUTEDSL | WIDEEP | TRTLLM |
+#                       DEEPGEMM | DENSEGEMM | VANILLA | TRITON | MARLIN |
+#                       MEGAMOE_DEEPGEMM                     llm_args.py MoeConfig
+#   transceiver backend DEFAULT | UCX | NIXL | MOONCAKE | MPI  llm_args.py:3836
+#
+# WHAT IS ACTUALLY IMPORTABLE IN THIS CONTAINER, checked, not assumed:
+#   flashinfer  yes      nixl  yes      kvbm  yes
+#   deep_gemm   NO       deep_ep  NO    mooncake  NO      lmcache  NO
+# So DEEPGEMM and MEGAMOE_DEEPGEMM will fail at import, MOONCAKE has no library
+# behind it, and the kv_connector registry's lmcache entries point at a module
+# that is not here (connectors/registry.py:23-31). kvbm is the one connector
+# that could be switched on today.
+#
+# Qwen3-235B-A22B is a MoE model, so moe_config.backend is the larger operator
+# lever of the two; attn_backend is the one with a working alternative
+# installed.
+: "${ATTN_BACKEND:=TRTLLM}"
+: "${MOE_BACKEND:=AUTO}"
+: "${XFER_BACKEND:=UCX}"
 : "${MAX_TOKENS_IN_BUFFER:=4096}"
 # CUDA graphs are configured through --extra-engine-args, NOT through
 # --enable-cuda-graph. That flag exists on `dynamo.trtllm`, is accepted, and is
@@ -260,7 +291,17 @@ unset NATS_SERVER ETCD_ENDPOINTS ETCD_URL 2>/dev/null
 export DYN_LOG=info
 
 cat > "$OUT/engine.yaml" <<YAML
+attn_backend: ${ATTN_BACKEND}
+moe_config:
+  backend: ${MOE_BACKEND}
 cuda_graph_config:
+  # `mode` is the union discriminator, not decoration: cuda_graph_config is
+  # Optional[Annotated[Union[DecodeCudaGraphConfig, EncodeCudaGraphConfig],
+  # discriminator="mode"]], so a dict without it fails validation with
+  # "Unable to extract tag using discriminator 'mode'" and takes the worker
+  # with it. CudaGraphConfig.mode has a default of "decode", which is what
+  # makes omitting it look safe.
+  mode: decode
   # max_batch_size defaults to 0 and enable_padding to False, so a capture that
   # is merely "enabled" captures nothing and a varying decode batch misses what
   # little it did capture. Decode residency at N=80 is ~23 per worker.
@@ -270,7 +311,7 @@ cuda_graph_config:
 # first real request, not at startup. UCX rather than DEFAULT: DEFAULT resolves
 # to NIXL, which FileLocks a hardcoded path under the node-shared /tmp.
 cache_transceiver_config:
-  backend: UCX
+  backend: ${XFER_BACKEND}
   # THE FIX FOR THE DEADLOCK. Default is None (llm_args.py:3852). Jobs 315810,
   # 315919, 315920 and 315954 all served ONE request fine and then deadlocked
   # under concurrency, with the decode worker logging 60 s KV transfer timeouts
