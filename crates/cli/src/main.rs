@@ -182,8 +182,9 @@ fn cmd_plan(cfg: &Config, total_gpus: u32, prefill_tp: &[u32], decode_tp: &[u32]
     );
     println!();
     println!(
-        "{:>5} {:>5} {:>7} {:>7} {:>9} {:>12} {:>11} {:>10}",
-        "P gpu", "D gpu", "P tp", "D tp", "P workers", "prefill r/s", "decode r/s", "goodput"
+        "{:>5} {:>5} {:>7} {:>7} {:>9} {:>12} {:>11} {:>10} {:>10} {:<11} {:>8}",
+        "P gpu", "D gpu", "P tp", "D tp", "P workers", "prefill r/s", "decode r/s",
+        "xfer r/s", "goodput", "binds on", "headroom"
     );
     for s in model
         .search(total_gpus, prefill_tp, decode_tp)
@@ -191,7 +192,7 @@ fn cmd_plan(cfg: &Config, total_gpus: u32, prefill_tp: &[u32], decode_tp: &[u32]
         .take(top)
     {
         println!(
-            "{:>5} {:>5} {:>7} {:>7} {:>9} {:>12.2} {:>11.2} {:>10.2}",
+            "{:>5} {:>5} {:>7} {:>7} {:>9} {:>12.2} {:>11.2} {:>10.2} {:>10.2} {:<11} {:>7.1}x",
             s.prefill_gpus,
             s.decode_gpus,
             s.prefill_tp,
@@ -199,7 +200,10 @@ fn cmd_plan(cfg: &Config, total_gpus: u32, prefill_tp: &[u32], decode_tp: &[u32]
             s.prefill_workers,
             s.prefill_req_s,
             s.decode_req_s,
-            s.goodput_req_s
+            s.transfer_req_s,
+            s.goodput_req_s,
+            format!("{:?}", s.bottleneck),
+            s.headroom_ratio
         );
     }
     println!();

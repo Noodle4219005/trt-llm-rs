@@ -44,6 +44,15 @@ impl Config {
             decode: self.calibration.decode,
             good_frac: self.calibration.assumed_good_frac,
             itl_safety: self.scheduler.itl_safety,
+            // Derived from the model shape rather than restated, so the
+            // capacity model and the simulator cannot disagree about how big
+            // one request's KV is.
+            kv_bytes_per_token: 2.0
+                * f64::from(self.model.num_layers)
+                * f64::from(self.model.num_kv_heads)
+                * f64::from(self.model.head_dim),
+            kv_xfer_gib_s: self.calibration.kv_xfer_gib_s,
+            xfer_concurrency: self.kv.xfer_concurrency,
         }
     }
 

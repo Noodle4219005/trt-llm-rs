@@ -168,6 +168,20 @@ impl DecodeCalibration {
     }
 }
 
+/// Which resource sets the sustainable rate. Always named, because a model
+/// that reports only a number cannot say what to attack -- and because a
+/// resource missing from the model is reported as one of the others being
+/// slow. This deployment ran for six jobs with the KV transfer absent from
+/// the model, and every prediction blamed prefill or decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Bottleneck {
+    Prefill,
+    Decode,
+    /// The P/D handoff: `xfer_concurrency` buffers, each holding one request's
+    /// KV for the duration of its transfer.
+    KvTransfer,
+}
+
 /// One candidate prefill/decode topology and the goodput it can reach.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PdSplit {
@@ -178,10 +192,19 @@ pub struct PdSplit {
     pub prefill_workers: u32,
     pub prefill_req_s: f64,
     pub decode_req_s: f64,
-    /// `min(prefill, decode)` - the rate the deployment can actually sustain.
+    /// Requests per second the KV handoff can retire, from the buffer count
+    /// and the per-request transfer time.
+    pub transfer_req_s: f64,
+    /// `min(prefill, decode, transfer)` - the rate the deployment can sustain.
     pub sustainable_req_s: f64,
     /// `sustainable_req_s * good_frac`.
     pub goodput_req_s: f64,
+    pub bottleneck: Bottleneck,
+    /// How many times faster the binding resource would have to be before the
+    /// next one binds. 1.0 means two resources are tied; a large number means
+    /// everything else is idle waiting for this one, which is the shape job
+    /// 316849 measured and nobody could name at the time.
+    pub headroom_ratio: f64,
 }
 
 /// The full model: workload shape plus both calibrations.
@@ -198,6 +221,16 @@ pub struct CapacityModel {
     pub good_frac: f64,
     /// Headroom kept against the ITL budget when sizing decode concurrency.
     pub itl_safety: f64,
+    /// KV bytes per token, both halves, summed over layers and heads for ONE
+    /// worker's shard. Qwen3-235B-A22B FP8: 2 x 94 x 4 x 128 = 96,256.
+    pub kv_bytes_per_token: f64,
+    /// Effective P/D transfer bandwidth, GiB/s. See CalibrationConfig::
+    /// kv_xfer_gib_s -- 2.1 is an upper bound taken from job 316849, not a
+    /// fabric measurement.
+    pub kv_xfer_gib_s: f64,
+    /// Transfer buffers per decode worker. Upstream ships ONE
+    /// (baseTransBuffer.cpp:109); this deployment configures sixteen.
+    pub xfer_concurrency: u32,
 }
 
 impl Default for CapacityModel {
@@ -210,11 +243,31 @@ impl Default for CapacityModel {
             decode: DecodeCalibration::default(),
             good_frac: 0.93,
             itl_safety: 1.0,
+            kv_bytes_per_token: 2.0 * 94.0 * 4.0 * 128.0,
+            kv_xfer_gib_s: 2.1,
+            xfer_concurrency: 16,
         }
     }
 }
 
 impl CapacityModel {
+    /// Milliseconds to move one request's KV from a prefill worker to a decode
+    /// worker.
+    pub fn transfer_ms(&self) -> f64 {
+        let bytes = self.kv_bytes_per_token * f64::from(self.isl);
+        (bytes / (self.kv_xfer_gib_s * 1024.0 * 1024.0 * 1024.0)) * 1000.0
+    }
+
+    /// Requests per second the handoff can retire: one buffer holds one
+    /// request for the whole transfer, so the rate is buffers over duration.
+    pub fn transfer_req_s(&self, decode_workers: u32) -> f64 {
+        let ms = self.transfer_ms();
+        if ms <= 0.0 || decode_workers == 0 {
+            return f64::INFINITY;
+        }
+        f64::from(decode_workers) * f64::from(self.xfer_concurrency.max(1)) * 1000.0 / ms
+    }
+
     pub fn evaluate(
         &self,
         prefill_gpus: u32,
@@ -229,7 +282,22 @@ impl CapacityModel {
         let decode_req_s = self
             .decode
             .req_per_s(decode_gpus, self.osl, &self.slo, self.itl_safety);
-        let sustainable = prefill_req_s.min(decode_req_s);
+        let decode_workers = decode_gpus.checked_div(decode_tp).unwrap_or(0);
+        let transfer_req_s = self.transfer_req_s(decode_workers);
+
+        let mut rates = [
+            (Bottleneck::Prefill, prefill_req_s),
+            (Bottleneck::Decode, decode_req_s),
+            (Bottleneck::KvTransfer, transfer_req_s),
+        ];
+        rates.sort_by(|a, b| a.1.partial_cmp(&b.1).expect("rates are finite"));
+        let (bottleneck, sustainable) = rates[0];
+        let headroom_ratio = if sustainable > 0.0 {
+            rates[1].1 / sustainable
+        } else {
+            f64::INFINITY
+        };
+
         PdSplit {
             prefill_gpus,
             decode_gpus,
@@ -238,8 +306,11 @@ impl CapacityModel {
             prefill_workers,
             prefill_req_s,
             decode_req_s,
+            transfer_req_s,
             sustainable_req_s: sustainable,
             goodput_req_s: sustainable * self.good_frac,
+            bottleneck,
+            headroom_ratio,
         }
     }
 
@@ -287,6 +358,53 @@ impl CapacityModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Job 316849 as a regression: 2 TP4 prefill workers, one TP8 decode
+    /// worker, and upstream's single transfer buffer. The model must name the
+    /// handoff, because for six jobs it could not -- KvTransfer was not a
+    /// resource it had, so every prediction blamed prefill or decode and the
+    /// deployment was measured at 4.08 req/s with nothing saturated.
+    #[test]
+    fn the_model_names_the_handoff_when_it_is_the_constraint() {
+        let mut m = CapacityModel::default();
+        m.xfer_concurrency = 1;
+        let s = m.evaluate(8, 8, 4, 8);
+
+        assert_eq!(
+            s.bottleneck,
+            Bottleneck::KvTransfer,
+            "prefill {:.2}, decode {:.2}, transfer {:.2} r/s",
+            s.prefill_req_s,
+            s.decode_req_s,
+            s.transfer_req_s
+        );
+        // 96,256 B/token x 4000 tokens / 2.1 GiB/s = 170.75 ms, one buffer.
+        assert!(
+            (s.sustainable_req_s - 5.86).abs() < 0.2,
+            "expected the single-buffer ceiling near 5.86 r/s, got {:.2}",
+            s.sustainable_req_s
+        );
+        assert!(
+            s.headroom_ratio > 2.0,
+            "everything else should be idle behind the handoff; headroom {:.1}x",
+            s.headroom_ratio
+        );
+    }
+
+    /// The same topology with the buffers this deployment configures. The
+    /// handoff must stop binding, or raising the count buys nothing.
+    #[test]
+    fn sixteen_buffers_move_the_constraint_off_the_handoff() {
+        let m = CapacityModel::default();
+        let s = m.evaluate(8, 8, 4, 8);
+        assert_ne!(
+            s.bottleneck,
+            Bottleneck::KvTransfer,
+            "still handoff-bound at {} buffers: transfer {:.2} r/s",
+            m.xfer_concurrency,
+            s.transfer_req_s
+        );
+    }
 
     /// The model must still reproduce the run it was calibrated against:
     /// 2P2D, prefill TP4 on 8 GPUs, decode TP8 on 8 GPUs, measured 14.35 req/s.
