@@ -47,6 +47,21 @@ enum Command {
         top: usize,
     },
     /// Run the deployment in simulation and print the scored result.
+    /// Compare a finished run's AIPerf export with what the model predicted
+    /// for it. Six 16-GPU jobs were read against a model that was never
+    /// printed beside a result.
+    Verdict {
+        /// Path to profile_export_aiperf.json.
+        #[arg(long)]
+        aiperf: std::path::PathBuf,
+        /// Predicted goodput. Defaults to what the capacity model says for the
+        /// configured topology.
+        #[arg(long)]
+        expect: Option<f64>,
+        /// Fraction the measurement may fall short and still count as agreement.
+        #[arg(long, default_value_t = 0.15)]
+        tolerance: f64,
+    },
     Sim {
         #[arg(long)]
         concurrency: Option<u32>,
@@ -136,6 +151,53 @@ fn main() -> Result<()> {
             decode_tp,
             top,
         } => cmd_plan(&cfg, total_gpus, &prefill_tp, &decode_tp, top),
+        Command::Verdict {
+            aiperf,
+            expect,
+            tolerance,
+        } => {
+            let text = std::fs::read_to_string(&aiperf)
+                .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", aiperf.display()))?;
+            let doc: serde_json::Value = serde_json::from_str(&text)?;
+            let measured = trtllm_core::verdict::MeasuredRun::from_aiperf_json(&doc)
+                .map_err(|e| anyhow::anyhow!("{}: {e}", aiperf.display()))?;
+
+            let model = cfg.capacity_model();
+            let split = model.evaluate(
+                cfg.topology.prefill_workers * cfg.topology.prefill_tp,
+                cfg.topology.decode_workers * cfg.topology.decode_tp,
+                cfg.topology.prefill_tp,
+                cfg.topology.decode_tp,
+            );
+            let predicted = expect.unwrap_or(split.goodput_req_s);
+
+            let v = trtllm_core::verdict::Verdict::assess(
+                measured,
+                predicted,
+                &cfg.slo,
+                split.bottleneck,
+                tolerance,
+            );
+            println!("{}", v.summary());
+            println!();
+            println!(
+                "  goodput      {:>8.2} measured   {:>8.2} predicted",
+                v.measured.goodput_req_s, v.predicted_goodput_req_s
+            );
+            println!(
+                "  throughput   {:>8.2} req/s      {:>8.0} tok/s output",
+                v.measured.request_throughput_req_s, v.measured.output_token_throughput
+            );
+            println!(
+                "  TTFT         {:>8.0} avg ms     {:>8.0} p90 ms   budget {:.0}",
+                v.measured.ttft_avg_ms, v.measured.ttft_p90_ms, cfg.slo.ttft_ms
+            );
+            println!(
+                "  ITL          {:>8.1} avg ms                  budget {:.0}",
+                v.measured.itl_avg_ms, cfg.slo.itl_ms
+            );
+            println!("  requests     {:>8.0}", v.measured.request_count);
+        }
         Command::Sim {
             concurrency,
             prefill_tp,

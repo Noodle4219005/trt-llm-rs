@@ -533,7 +533,20 @@ echo "  engine.yaml:"; sed 's/^/    /' "$OUT/engine.yaml"
 
 PIDS=()
 cleanup () {
-  echo; echo "########## teardown ##########"
+  echo; echo "echo; echo "########## verdict ##########"
+# The run says whether it met the prediction it printed at the top, and when it
+# did not, which gate held and which broke. Job 316849 needed a person reading a
+# console table to work out that TTFT passed and ITL missed by 4.6x.
+EXPORT="$OUT/aiperf/profile_export_aiperf.json"
+if [ -f "$EXPORT" ]; then
+  srun -N1 -n1 -w "$NODE_A" --overlap apptainer exec $BIND "$SIF" \
+    "$STAGE/trt-llm-rs" verdict --aiperf "$EXPORT" 2>&1 | sed 's/^/  /' \
+    || echo "  (verdict unavailable)"
+else
+  echo "  no AIPerf export at $EXPORT -- nothing to assess"
+fi
+
+########## teardown ##########"
   kill "${PIDS[@]}" 2>/dev/null; sleep 10
   srun -N2 -n2 --overlap bash -c 'pkill -f "dynamo.trtllm"; pkill -f "dynamo.frontend"' 2>/dev/null
   sleep 5

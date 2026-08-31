@@ -17,6 +17,7 @@ pub mod remedy;
 pub mod request;
 pub mod slo;
 pub mod stats;
+pub mod verdict;
 
 pub use capacity::{CapacityModel, PdSplit};
 pub use error::{Error, Result};
