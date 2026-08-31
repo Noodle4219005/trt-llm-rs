@@ -224,6 +224,23 @@ pub struct KvConfig {
     /// Fraction of the pool that must stay free before a new sequence is
     /// admitted, so an in-flight sequence never gets preempted mid-decode.
     pub admission_watermark: f64,
+    /// How many P/D KV transfers may be in flight at once, per decode worker.
+    ///
+    /// Sixteen, because that is what this deployment configures. UPSTREAM'S
+    /// DEFAULT IS ONE, and the difference is the whole point: `mRecvBufferCount = getEnvRequestKVCacheConcurrent()
+    /// ? getEnvKVCacheRecvBufferCount() : 1` (baseTransBuffer.cpp:109), and
+    /// TRTLLM_REQUEST_KV_CACHE_CONCURRENT defaults to false, so the declared
+    /// default of 2 on the count is never read. assignBufferIndex then blocks
+    /// on a condition variable while the one buffer is taken.
+    ///
+    /// The simulator used to schedule the handoff as a fixed delay with no
+    /// contention, which is why it could not reproduce job 316849's ceiling:
+    /// serialised transfers of 181.85 ms cap the system at 5.50 req/s no matter
+    /// how many GPUs are behind them, and 4.08 req/s was measured.
+    ///
+    /// Set this to 1 to model an unconfigured deployment; the simulator then
+    /// reproduces the ceiling instead of predicting past it.
+    pub xfer_concurrency: u32,
 }
 
 impl Default for KvConfig {
@@ -233,6 +250,7 @@ impl Default for KvConfig {
             num_blocks: 8192,
             enable_prefix_cache: false,
             admission_watermark: 0.05,
+            xfer_concurrency: 16,
         }
     }
 }
@@ -243,6 +261,30 @@ pub struct CalibrationConfig {
     pub prefill: PrefillCalibration,
     pub decode: DecodeCalibration,
     pub assumed_good_frac: f64,
+    /// Effective P/D KV transfer bandwidth in GiB/s, per transfer.
+    ///
+    /// 2.1, from job 316849, and it is an UPPER bound on the fabric rather than
+    /// a measurement of it. The model shape gives 0.359 GiB of KV for a
+    /// 4000-token request (2 x 94 layers x 4 KV heads x 128 dim), and AIPerf
+    /// measured Time to Second Token -- the gap between the prefill worker's
+    /// first token and the decode worker's second -- at avg 181.85 ms with
+    /// p50 191 and p99 208. 0.359 / 0.18185 = 1.97 GiB/s.
+    ///
+    /// That interval contains the transfer, whatever queue it waited in, and
+    /// the first decode step, so the fabric may be faster than this and
+    /// something else slower. What it is not is 40 GiB/s, which this simulator
+    /// assumed and which made the handoff 19x too cheap to ever bind. A model
+    /// that cannot represent the constraint cannot warn about it, and job
+    /// 316849 spent 163 SU discovering one this simulator had already been
+    /// asked about.
+    ///
+    /// Worth checking against the SGLang precedent recorded in
+    /// scripts/stage-d-235b-disagg.sbatch: per-token RDMA there generated
+    /// 4000 x 94 = ~376,000 small operations per request, which at 0.48 us each
+    /// is the same 182 ms. If TensorRT-LLM does likewise, this constant is
+    /// measuring operation count, not bandwidth, and will not improve with a
+    /// faster fabric.
+    pub kv_xfer_gib_s: f64,
 }
 
 impl Default for CalibrationConfig {
@@ -251,6 +293,7 @@ impl Default for CalibrationConfig {
             prefill: PrefillCalibration::default(),
             decode: DecodeCalibration::default(),
             assumed_good_frac: 0.93,
+            kv_xfer_gib_s: 2.1,
         }
     }
 }

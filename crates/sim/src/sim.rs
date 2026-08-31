@@ -61,6 +61,13 @@ pub struct Simulator {
     prefill: Vec<PrefillWorkerSim>,
     decode: Vec<DecodeWorkerSim>,
     router: Router,
+    /// P/D KV transfers currently occupying a buffer, and the ones queued for
+    /// one. Upstream's pool holds `cfg.kv.xfer_concurrency` buffers and blocks
+    /// when they are all taken, so an unbounded fixed delay is the wrong model
+    /// -- it is the difference between predicting a 5.50 req/s ceiling and
+    /// predicting none at all.
+    xfer_busy: u32,
+    xfer_queue: VecDeque<(RequestId, usize)>,
     outcomes: Vec<RequestOutcome>,
     // accumulators
     issued: usize,
@@ -182,6 +189,8 @@ impl Simulator {
             prefill,
             decode,
             router,
+            xfer_busy: 0,
+            xfer_queue: VecDeque::new(),
             outcomes: Vec::new(),
             issued: 0,
             batches: 0,
@@ -340,12 +349,29 @@ impl Simulator {
                 r.last_token_ms = self.now;
                 r.decode_worker
             };
-            self.push(self.now + transfer, Event::KvArrived { id, worker: dw });
+            self.xfer_queue.push_back((id, dw));
         }
+        self.drain_xfer_queue(transfer);
         self.try_start_prefill(w);
     }
 
+    /// Start as many queued transfers as there are free buffers.
+    fn drain_xfer_queue(&mut self, transfer: Millis) {
+        let cap = self.cfg.kv.xfer_concurrency.max(1);
+        while self.xfer_busy < cap {
+            let Some((id, dw)) = self.xfer_queue.pop_front() else {
+                return;
+            };
+            self.xfer_busy += 1;
+            self.push(self.now + transfer, Event::KvArrived { id, worker: dw });
+        }
+    }
+
     fn on_kv_arrived(&mut self, id: RequestId, w: usize) {
+        // The buffer this transfer held is now free for whoever is waiting.
+        self.xfer_busy = self.xfer_busy.saturating_sub(1);
+        let transfer = kv_transfer_ms(&self.cfg);
+        self.drain_xfer_queue(transfer);
         self.decode[w].pending.push_back(id);
         if !self.decode[w].stepping {
             self.decode[w].stepping = true;
@@ -534,7 +560,7 @@ fn kv_transfer_ms(cfg: &Config) -> f64 {
     let bytes_per_token =
         2.0 * f64::from(m.num_layers) * f64::from(m.num_kv_heads) * f64::from(m.head_dim);
     let bytes = bytes_per_token * f64::from(cfg.workload.isl);
-    let gib_s = 40.0;
+    let gib_s = cfg.calibration.kv_xfer_gib_s;
     0.5 + (bytes / (gib_s * 1024.0 * 1024.0 * 1024.0)) * 1000.0
 }
 
@@ -550,6 +576,57 @@ mod tests {
         c.workload.grace_s = 10.0;
         c.workload.concurrency = 48;
         c
+    }
+
+    /// Serialised KV transfer is a throughput ceiling that no amount of GPU
+    /// removes, and the simulator could not see it: the handoff was scheduled
+    /// as a fixed delay with unbounded overlap. Job 316849 measured 4.08 req/s
+    /// against a serialised bound of 1000/181.85 = 5.50 req/s while nothing in
+    /// the deployment was saturated.
+    #[test]
+    fn serialised_kv_transfer_caps_throughput_and_more_buffers_lift_it() {
+        // A longer window than short_config's, because the point of the
+        // serialised arm is that it barely completes anything: at 171 ms per
+        // transfer it clears 5.8 req/s, and an 8 s scored window can close
+        // with nothing in it, which is indistinguishable from a broken test.
+        let run = |n: u32| {
+            let mut c = short_config();
+            c.workload.benchmark_s = 60.0;
+            c.workload.grace_s = 30.0;
+            c.kv.xfer_concurrency = n;
+            Simulator::new(SimSetup { config: c }).run()
+        };
+        let one = run(1);
+        let many = run(16);
+
+        // Serialisation is not "slower", it is "nothing comes out". With one
+        // buffer the simulator completes 48 requests in 92 simulated seconds
+        // and scores none of them; with sixteen it completes 1056 and scores
+        // 696. Decode concurrency is 1.3 against 36.4 and the prefill workers
+        // sit 92% idle -- which is job 316849's signature exactly: a
+        // deployment where nothing is saturated and throughput is still bad.
+        assert_eq!(
+            one.goodput.total_requests, 0,
+            "one transfer buffer scored {} requests; if serialisation has \
+             stopped being catastrophic here, the ceiling this test exists to \
+             pin has moved and the arithmetic in KvConfig::xfer_concurrency \
+             needs re-deriving",
+            one.goodput.total_requests
+        );
+        assert!(
+            many.goodput.total_requests > 100,
+            "sixteen buffers scored only {} requests, so the comparison says \
+             nothing about the buffer count: {:?}",
+            many.goodput.total_requests,
+            many.diagnostics
+        );
+        assert!(
+            many.diagnostics.mean_decode_concurrency
+                > 10.0 * one.diagnostics.mean_decode_concurrency,
+            "decode concurrency barely moved: {:.2} -> {:.2}",
+            one.diagnostics.mean_decode_concurrency,
+            many.diagnostics.mean_decode_concurrency
+        );
     }
 
     #[test]

@@ -26,5 +26,5 @@ apptainer exec --bind /work/u5727520,/home/u5727520,$HOME/.cargo,$HOME/.rustup "
   bash -lc "cd $SRC && export CARGO_TARGET_DIR=$TARGET CARGO_BUILD_JOBS=\$(nproc) \
     RUSTFLAGS='--cfg tokio_unstable' && \
     cargo test --workspace --exclude trtllm-pyhost --exclude trtllm-pyext \
-      --all-targets --no-fail-fast 2>&1 | tail -60"
+      --all-targets --no-fail-fast 2>&1 | tail -200"
 echo "exit=$?  $(date -Is)"
