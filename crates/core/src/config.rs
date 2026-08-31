@@ -53,6 +53,9 @@ impl Config {
                 * f64::from(self.model.head_dim),
             kv_xfer_gib_s: self.calibration.kv_xfer_gib_s,
             xfer_concurrency: self.kv.xfer_concurrency,
+            weights_gib: self.model.weights_gib,
+            gpu_gib: self.topology.gpu_gib,
+            min_free_gib_per_rank: self.topology.min_free_gib_per_rank,
         }
     }
 
@@ -90,6 +93,11 @@ pub struct ModelConfig {
     pub hidden_size: u32,
     pub num_kv_heads: u32,
     pub head_dim: u32,
+    /// Stored weights, GiB. 220.2 measured over the 24 FP8 safetensors shards
+    /// of Qwen3-235B-A22B-Instruct-2507. This is what has to fit, and it is
+    /// the stored count rather than the 22B active -- routing chooses which
+    /// experts run, not which are resident.
+    pub weights_gib: f64,
 }
 
 impl Default for ModelConfig {
@@ -103,6 +111,7 @@ impl Default for ModelConfig {
             hidden_size: 4096,
             num_kv_heads: 4,
             head_dim: 128,
+            weights_gib: 220.2,
         }
     }
 }
@@ -150,6 +159,12 @@ pub struct TopologyConfig {
     pub prefill_tp: u32,
     pub decode_workers: u32,
     pub decode_tp: u32,
+    /// Usable GiB on one GPU after the driver's reservation. 131 on H200.
+    pub gpu_gib: f64,
+    /// GiB a rank needs beyond its weight shard. See
+    /// `CapacityModel::min_free_gib_per_rank` -- bracketed by measurement at
+    /// TP2 (21 GiB, unrunnable) and TP4 (76 GiB, runs), not observed directly.
+    pub min_free_gib_per_rank: f64,
 }
 
 impl Default for TopologyConfig {
@@ -159,10 +174,16 @@ impl Default for TopologyConfig {
     fn default() -> Self {
         Self {
             total_gpus: 16,
-            prefill_workers: 4,
-            prefill_tp: 2,
-            decode_workers: 1,
-            decode_tp: 8,
+            prefill_workers: 2,
+            // 2P2D on TP4, the shape this deployment runs. It was 4P1D on
+            // TP2 until TP2 was measured unrunnable -- 110.1 GiB of weights on
+            // a 131 GiB card leaves 21 GiB, which cannot hold the activation
+            // workspace, the CUDA graphs and a KV pool at once.
+            prefill_tp: 4,
+            decode_workers: 2,
+            decode_tp: 4,
+            gpu_gib: 131.0,
+            min_free_gib_per_rank: 40.0,
         }
     }
 }
@@ -311,13 +332,24 @@ impl Default for CalibrationConfig {
 mod tests {
     use super::*;
 
+    /// The default describes the deployment that runs, and every part of it has
+    /// been measured. It was 4P1D on TP2 prefill with a TP8 decode worker until
+    /// both halves of that were refuted: TP2 leaves 21 GiB per rank and is
+    /// unrunnable at any KV fraction, and one TP8 decode worker delivered
+    /// 815 tok/s where two TP4 workers reach 2,170-2,470 -- Qwen3-235B has four
+    /// KV heads, so TP4 gives each rank one and TP8 must duplicate.
     #[test]
-    fn default_config_is_valid_and_is_4p1d() {
+    fn default_config_is_valid_and_is_2p2d_on_tp4() {
         let c = Config::default();
         c.validate().expect("default config must validate");
-        assert_eq!(c.topology.prefill_workers, 4);
-        assert_eq!(c.topology.prefill_tp, 2);
-        assert_eq!(c.topology.decode_tp, 8);
+        assert_eq!(c.topology.prefill_workers, 2);
+        assert_eq!(c.topology.prefill_tp, 4);
+        assert_eq!(c.topology.decode_workers, 2);
+        assert_eq!(c.topology.decode_tp, 4);
+        // Every rank must have room for more than its weight shard.
+        let m = c.capacity_model();
+        assert!(m.fits_in_memory(c.topology.prefill_tp));
+        assert!(m.fits_in_memory(c.topology.decode_tp));
         assert_eq!(
             c.topology.prefill_workers * c.topology.prefill_tp
                 + c.topology.decode_workers * c.topology.decode_tp,

@@ -346,6 +346,22 @@ pub struct CapacityModel {
     /// Transfer buffers per decode worker. Upstream ships ONE
     /// (baseTransBuffer.cpp:109); this deployment configures sixteen.
     pub xfer_concurrency: u32,
+    /// Total model weights, GiB. 220.2 measured over the 24 FP8 safetensors
+    /// shards of Qwen3-235B-A22B-Instruct-2507.
+    pub weights_gib: f64,
+    /// Usable memory on one GPU, GiB. 131 for an H200 after the driver's
+    /// reservation.
+    pub gpu_gib: f64,
+    /// Free memory a rank needs beyond its weight shard, GiB.
+    ///
+    /// BRACKETED BY MEASUREMENT, NOT MEASURED. TP2 leaves 21 GiB and is
+    /// unrunnable: PREFILL_KV_FRACTION 0.30 starts and then dies under
+    /// AIPerf's opening burst with "No free block found", 0.50 stalls in
+    /// warmup and never registers its endpoint, and 0.70 OOMs during
+    /// cudaMalloc at startup. TP4 leaves 76 GiB and runs. The true threshold
+    /// is somewhere in (21, 76] and 40 is a midpoint that classifies both
+    /// measured points correctly -- it is not a number anyone has observed.
+    pub min_free_gib_per_rank: f64,
 }
 
 impl Default for CapacityModel {
@@ -361,11 +377,30 @@ impl Default for CapacityModel {
             kv_bytes_per_token: 2.0 * 94.0 * 4.0 * 128.0,
             kv_xfer_gib_s: 2.1,
             xfer_concurrency: 16,
+            weights_gib: 220.2,
+            gpu_gib: 131.0,
+            min_free_gib_per_rank: 40.0,
         }
     }
 }
 
 impl CapacityModel {
+    /// Whether a worker at this tensor-parallel degree has room to run.
+    ///
+    /// The capacity model used to answer only "how fast would this be", which
+    /// is the wrong question to answer first about a topology that cannot
+    /// load. `plan` recommended 8 x TP2 prefill workers as its best 16-GPU
+    /// split for as long as this was missing, and TP2 had already been
+    /// measured unrunnable at three different KV fractions.
+    pub fn fits_in_memory(&self, tp: u32) -> bool {
+        self.free_gib_per_rank(tp) >= self.min_free_gib_per_rank
+    }
+
+    /// GiB left on a rank after its share of the weights.
+    pub fn free_gib_per_rank(&self, tp: u32) -> f64 {
+        self.gpu_gib - self.weights_gib / f64::from(tp.max(1))
+    }
+
     /// Milliseconds to move one request's KV from a prefill worker to a decode
     /// worker.
     pub fn transfer_ms(&self) -> f64 {
@@ -440,6 +475,13 @@ impl CapacityModel {
                 if ptp == 0 || dtp == 0 {
                     continue;
                 }
+                // A topology that cannot load is not a fast topology. This
+                // filter is why `plan` no longer offers TP2 prefill workers,
+                // which it ranked first for as long as speed was the only
+                // question it asked.
+                if !self.fits_in_memory(ptp) || !self.fits_in_memory(dtp) {
+                    continue;
+                }
                 let mut p = ptp;
                 while p + dtp <= total_gpus {
                     let d = total_gpus - p;
@@ -473,6 +515,27 @@ impl CapacityModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `plan` used to rank 8 x TP2 prefill first on a 16-GPU node, and TP2 had
+    /// already been measured unrunnable at three separate KV fractions: 0.30
+    /// dies under the opening burst, 0.50 stalls in warmup, 0.70 OOMs at
+    /// startup. A model that only answers "how fast" recommends things that do
+    /// not load.
+    #[test]
+    fn a_topology_that_cannot_load_is_not_offered() {
+        let m = CapacityModel::default();
+        assert!(!m.fits_in_memory(2), "TP2 leaves {:.1} GiB", m.free_gib_per_rank(2));
+        assert!(m.fits_in_memory(4), "TP4 leaves {:.1} GiB", m.free_gib_per_rank(4));
+        assert!(m.fits_in_memory(8));
+
+        let splits = m.search(16, &[2, 4, 8], &[4, 8]);
+        assert!(!splits.is_empty(), "the search returned nothing at all");
+        assert!(
+            splits.iter().all(|s| s.prefill_tp != 2),
+            "TP2 prefill is still being recommended: {:?}",
+            splits.iter().map(|s| s.prefill_tp).collect::<Vec<_>>()
+        );
+    }
 
     /// The attribution the roadmap rests on: the grouped GEMM is the lever,
     /// not the collective.
@@ -650,21 +713,39 @@ mod tests {
         assert!(c.tok_s_per_gpu_at_tp(8) < c.tok_s_per_gpu_at_tp(4));
     }
 
-    /// With TP2 prefill available, the search must prefer more, smaller prefill
-    /// workers over the symmetric TP4 split - the 4P1D shape. At 8/8 both
-    /// topologies are pinned by the same decode ceiling, so they tie on
-    /// goodput and the slack tie-break has to be what separates them.
+    /// Narrow prefill workers ARE faster per GPU, and that is exactly why the
+    /// memory constraint had to be added rather than argued with.
+    ///
+    /// Per-GPU prefill throughput rises as TP falls, because the TP all-reduce
+    /// is 25% of kernel time and shrinks with the group. This test used to
+    /// assert that the search therefore picks 4 x TP2 over 2 x TP4. It does
+    /// not any more: TP2 leaves 21 GiB per rank and was measured unrunnable at
+    /// three separate KV fractions. The throughput claim survives; the
+    /// recommendation does not.
     #[test]
-    fn search_prefers_narrow_prefill_workers() {
+    fn narrow_prefill_is_faster_and_still_must_not_be_recommended() {
         let m = CapacityModel::default();
+
+        // The reason TP2 is tempting, stated as an assertion so it stays true.
+        assert!(
+            m.prefill.tok_s_per_gpu_at_tp(2) > m.prefill.tok_s_per_gpu_at_tp(4),
+            "TP2 is no longer faster per GPU than TP4, so the memory filter is \
+             now costing nothing and the comment above is stale"
+        );
+
         let best = m
             .search(16, &[2, 4], &[8])
             .into_iter()
             .next()
             .expect("a topology");
-        assert_eq!(best.prefill_tp, 2, "4x TP2 prefill should win over 2x TP4");
+        assert_eq!(
+            best.prefill_tp, 4,
+            "TP2 prefill was recommended again; it leaves {:.1} GiB per rank \
+             against a {:.1} GiB requirement",
+            m.free_gib_per_rank(2),
+            m.min_free_gib_per_rank
+        );
         assert_eq!(best.decode_gpus, 8);
-        assert_eq!(best.prefill_workers, 4);
         assert!(
             best.prefill_req_s > best.decode_req_s,
             "at 8/8 the decode side is the binding one: {best:?}"
