@@ -52,6 +52,58 @@ pub struct PrefillCalibration {
     pub peak_tflops_per_gpu: f64,
 }
 
+/// The prefill FLOP budget, split into the three places it is spent.
+///
+/// Qwen3-235B-A22B on H200 at the calibrated 7796 tok/s/GPU:
+///
+/// ```text
+/// overall MFU          17.3%
+///   9.0% of wall time outside the forward pass      -> fixing it is 1.10x
+///  25.0% of kernel time in the TP all-reduce        -> removing it is 1.33x
+///   the remaining 68.2% of time runs at 25.3% MFU   -> 50% there is 1.97x
+/// ```
+///
+/// The conclusion is the useful part: even a free all-reduce and a perfect
+/// duty cycle leave the GEMMs at 25.3%. The largest lever is the grouped GEMM
+/// -- a MoE backend question -- and not the collective, which is what a
+/// 25%-of-kernel-time all-reduce figure invites you to attack first.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MfuBreakdown {
+    pub overall: f64,
+    /// Fraction of wall time actually spent issuing FLOPs.
+    pub compute_time_frac: f64,
+    /// MFU during that fraction: how well the kernels use the tensor cores
+    /// when they are the only thing running.
+    pub compute_mfu: f64,
+    /// Throughput multiplier from a perfect duty cycle.
+    pub duty_cycle_worth: f64,
+    /// Throughput multiplier from a free TP all-reduce.
+    pub allreduce_worth: f64,
+}
+
+impl MfuBreakdown {
+    /// Throughput multiplier from lifting the compute-phase MFU to `target`.
+    pub fn compute_mfu_worth(&self, target: f64) -> f64 {
+        if self.compute_mfu <= 0.0 {
+            return f64::INFINITY;
+        }
+        target / self.compute_mfu
+    }
+
+    /// The lever with the largest multiplier, so a reader is not left to
+    /// compare three numbers and pick wrong.
+    pub fn largest_lever(&self, compute_target: f64) -> (&'static str, f64) {
+        let candidates = [
+            ("duty cycle", self.duty_cycle_worth),
+            ("TP all-reduce", self.allreduce_worth),
+            ("compute MFU", self.compute_mfu_worth(compute_target)),
+        ];
+        candidates
+            .into_iter()
+            .fold(("", 0.0), |best, c| if c.1 > best.1 { c } else { best })
+    }
+}
+
 impl Default for PrefillCalibration {
     /// SGLang `ep1-2p2d-gwab-302350`, Qwen3-235B-A22B FP8, H200, TP4,
     /// `chunked_prefill_size=16384`, cold cache (0.0 % radix hit).
@@ -73,6 +125,31 @@ impl PrefillCalibration {
     ///
     /// `T(t) = compute + allreduce_unit * (t-1)/t`, normalised so that
     /// `T(tp_ref) == 1`.
+    /// Where the tensor cores go, and what each fix is worth.
+    ///
+    /// Reported as multipliers rather than percentages because the question
+    /// this answers is "which backend do I swap", and a percentage of a loss
+    /// does not say how much throughput removing it returns.
+    pub fn mfu_breakdown(&self) -> MfuBreakdown {
+        let compute_time_frac = self.duty_cycle * (1.0 - self.tp_allreduce_frac);
+        let overall = self.mfu();
+        MfuBreakdown {
+            overall,
+            compute_time_frac,
+            compute_mfu: if compute_time_frac > 0.0 {
+                overall / compute_time_frac
+            } else {
+                0.0
+            },
+            duty_cycle_worth: if self.duty_cycle > 0.0 {
+                1.0 / self.duty_cycle
+            } else {
+                f64::INFINITY
+            },
+            allreduce_worth: 1.0 / (1.0 - self.tp_allreduce_frac).max(1e-9),
+        }
+    }
+
     /// Achieved FP8 TFLOP/s on one GPU at `tp_ref`.
     ///
     /// A forward pass costs two FLOPs per parameter per token, and under
@@ -396,6 +473,45 @@ impl CapacityModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The attribution the roadmap rests on: the grouped GEMM is the lever,
+    /// not the collective.
+    ///
+    /// A 25%-of-kernel-time all-reduce reads like the obvious target. It is
+    /// worth 1.33x. The compute phase runs at 25.3% MFU and lifting that to
+    /// 50% is worth 1.97x, so the MoE backend outranks the comm backend --
+    /// and no amount of comm work reaches the competitor numbers.
+    #[test]
+    fn the_grouped_gemm_outranks_the_collective() {
+        let b = PrefillCalibration::default().mfu_breakdown();
+
+        assert!(
+            (b.compute_mfu - 0.253).abs() < 0.01,
+            "compute-phase MFU is {:.1}%, not the 25.3% the roadmap was \
+             derived from",
+            b.compute_mfu * 100.0
+        );
+        let (lever, worth) = b.largest_lever(0.50);
+        assert_eq!(
+            lever, "compute MFU",
+            "the largest lever is now {lever} at {worth:.2}x; the plan to \
+             attack MoE kernels was derived when it was compute MFU"
+        );
+        assert!(
+            worth > b.allreduce_worth && worth > b.duty_cycle_worth,
+            "compute {:.2}x vs all-reduce {:.2}x vs duty {:.2}x",
+            worth,
+            b.allreduce_worth,
+            b.duty_cycle_worth
+        );
+        // Even with both of the cheap fixes taken, the gap is still there.
+        assert!(
+            b.allreduce_worth * b.duty_cycle_worth < 1.6,
+            "the two non-kernel fixes are now worth {:.2}x together, which is \
+             enough to matter on its own",
+            b.allreduce_worth * b.duty_cycle_worth
+        );
+    }
 
     /// MFU is what says whether the next move is a kernel or a topology.
     ///

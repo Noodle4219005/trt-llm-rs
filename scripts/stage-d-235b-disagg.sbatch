@@ -236,6 +236,31 @@ set -uo pipefail
 : "${ATTN_BACKEND:=TRTLLM}"
 : "${MOE_BACKEND:=AUTO}"
 : "${XFER_BACKEND:=UCX}"
+
+# The fourth axis, and the one the MFU breakdown points at second. The TP
+# all-reduce is 25% of prefill kernel time, so removing it entirely would be
+# 1.33x -- less than the 1.97x in the grouped GEMM, but the cheapest of the
+# two to try because it is a one-word change.
+#
+#   AUTO (default) | NCCL | UB | MINLATENCY | ONESHOT | TWOSHOT |
+#   LOWPRECISION | MNNVL | NCCL_SYMMETRIC
+#
+# MNNVL wants an NVLink fabric this cluster does not provision: every worker
+# logs "the NVLink fabric/IMEX plane is NOT provisioned on this node, so NVLS
+# multicast memory cannot be bound". Do not spend a run on it without fixing
+# that first.
+#
+# NOT tried, and the reason is in the field description rather than a guess:
+# enable_min_latency is documented "Currently only used for Llama4".
+: "${ALLREDUCE_STRATEGY:=AUTO}"
+
+# Off upstream, and left off deliberately. Chunked prefill exists to interleave
+# a long prompt with decode work in the same iteration, and a disaggregated
+# prefill worker has no decode work to interleave with. At ISL 4000 against
+# max_num_tokens 8192 two whole prompts already fit in one iteration, which is
+# what the simulator's mean_prefill_batch_tokens of ~6000-7700 shows. Set it to
+# 1 to A/B that reasoning rather than trust it.
+: "${CHUNKED_PREFILL:=0}"
 : "${MAX_TOKENS_IN_BUFFER:=4096}"
 # CUDA graphs are configured through --extra-engine-args, NOT through
 # --enable-cuda-graph. That flag exists on `dynamo.trtllm`, is accepted, and is
@@ -290,8 +315,11 @@ export DYN_FILE_KV="$OUT/discovery"; mkdir -p "$DYN_FILE_KV"
 unset NATS_SERVER ETCD_ENDPOINTS ETCD_URL 2>/dev/null
 export DYN_LOG=info
 
+if [ "${CHUNKED_PREFILL}" = 1 ]; then CHUNKED_PREFILL_BOOL=true; else CHUNKED_PREFILL_BOOL=false; fi
 cat > "$OUT/engine.yaml" <<YAML
 attn_backend: ${ATTN_BACKEND}
+allreduce_strategy: ${ALLREDUCE_STRATEGY}
+enable_chunked_prefill: ${CHUNKED_PREFILL_BOOL}
 moe_config:
   backend: ${MOE_BACKEND}
 cuda_graph_config:

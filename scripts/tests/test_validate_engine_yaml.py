@@ -59,3 +59,32 @@ cache_transceiver_config:
 
     def test_a_backend_whose_library_is_present_is_accepted(self):
         self.assertEqual(problems("attn_backend: FLASHINFER"), [])
+
+    def test_the_full_ab_surface_renders_and_validates(self):
+        """Every axis at its default, as the script writes it."""
+        self.assertEqual(problems("""
+attn_backend: TRTLLM
+allreduce_strategy: AUTO
+enable_chunked_prefill: false
+moe_config:
+  backend: AUTO
+cuda_graph_config:
+  mode: decode
+  max_batch_size: 64
+  enable_padding: true
+cache_transceiver_config:
+  backend: UCX
+  max_tokens_in_buffer: 4096
+"""), [])
+
+    def test_a_misspelt_allreduce_strategy_is_rejected(self):
+        """This one IS a Literal, so the type check catches it without an
+        allowlist -- unlike attn_backend, which is a bare str."""
+        found = problems("allreduce_strategy: LOWPRECISON")
+        self.assertTrue(found)
+        self.assertIn("allreduce_strategy", found[0])
+
+    def test_every_allreduce_strategy_the_engine_lists_is_accepted(self):
+        for s in ("AUTO", "NCCL", "UB", "MINLATENCY", "ONESHOT", "TWOSHOT",
+                  "LOWPRECISION", "MNNVL", "NCCL_SYMMETRIC"):
+            self.assertEqual(problems(f"allreduce_strategy: {s}"), [], s)

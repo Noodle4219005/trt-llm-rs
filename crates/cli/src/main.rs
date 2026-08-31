@@ -188,10 +188,27 @@ fn cmd_plan(cfg: &Config, total_gpus: u32, prefill_tp: &[u32], decode_tp: &[u32]
         model.prefill.mfu() * 100.0,
         0.35 / model.prefill.mfu().max(1e-9)
     );
+    let b = model.prefill.mfu_breakdown();
+    let (lever, worth) = b.largest_lever(0.50);
     println!(
-        "                    which is a kernel question, not a topology one - \
-         no P/D split changes MFU."
+        "                    of which {:.0}% of wall time is outside the forward pass \
+         ({:.2}x), {:.0}% of kernel",
+        (1.0 - model.prefill.duty_cycle) * 100.0,
+        b.duty_cycle_worth,
+        model.prefill.tp_allreduce_frac * 100.0
     );
+    println!(
+        "                    time is TP all-reduce ({:.2}x), and the remaining compute \
+         runs at {:.1}% MFU ({:.2}x to 50%).",
+        b.allreduce_worth,
+        b.compute_mfu * 100.0,
+        b.compute_mfu_worth(0.50)
+    );
+    println!(
+        "                    Largest lever: {lever} at {worth:.2}x. This is a kernel \
+         question, not a topology one -"
+    );
+    println!("                    no P/D split changes MFU.");
     println!();
     println!(
         "{:>5} {:>5} {:>7} {:>7} {:>9} {:>12} {:>11} {:>10} {:>10} {:<11} {:>8}",
