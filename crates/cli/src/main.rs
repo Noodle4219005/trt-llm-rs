@@ -180,6 +180,18 @@ fn cmd_plan(cfg: &Config, total_gpus: u32, prefill_tp: &[u32], decode_tp: &[u32]
         model.prefill.tp_ref,
         model.prefill.tp_allreduce_frac * 100.0
     );
+    println!(
+        "                    {:.0} TFLOP/s of {:.0} peak = MFU {:.1}%. \
+         Reaching 35% would be {:.2}x this prefill throughput,",
+        model.prefill.achieved_tflops_per_gpu(),
+        model.prefill.peak_tflops_per_gpu,
+        model.prefill.mfu() * 100.0,
+        0.35 / model.prefill.mfu().max(1e-9)
+    );
+    println!(
+        "                    which is a kernel question, not a topology one - \
+         no P/D split changes MFU."
+    );
     println!();
     println!(
         "{:>5} {:>5} {:>7} {:>7} {:>9} {:>12} {:>11} {:>10} {:>10} {:<11} {:>8}",

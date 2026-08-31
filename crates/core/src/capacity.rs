@@ -42,6 +42,14 @@ pub struct PrefillCalibration {
     /// Fraction of wall time the GPU is inside a forward pass. 0.91 measured;
     /// the remaining 9 % is batch assembly and is already inside `tok_s_per_gpu`.
     pub duty_cycle: f64,
+    /// Parameters active per token, in billions. Qwen3-235B-A22B routes 8 of
+    /// 128 experts, so 22 rather than 235 -- prefill FLOPs follow the active
+    /// count, not the stored one.
+    pub active_params_b: f64,
+    /// Dense FP8 tensor-core peak for one GPU, TFLOP/s. 1979 for H200 SXM;
+    /// the 3958 on the datasheet is the 2:4-sparsity figure and does not apply
+    /// to these weights.
+    pub peak_tflops_per_gpu: f64,
 }
 
 impl Default for PrefillCalibration {
@@ -53,6 +61,8 @@ impl Default for PrefillCalibration {
             tp_ref: 4,
             tp_allreduce_frac: 0.25,
             duty_cycle: 0.91,
+            active_params_b: 22.0,
+            peak_tflops_per_gpu: 1979.0,
         }
     }
 }
@@ -63,6 +73,34 @@ impl PrefillCalibration {
     ///
     /// `T(t) = compute + allreduce_unit * (t-1)/t`, normalised so that
     /// `T(tp_ref) == 1`.
+    /// Achieved FP8 TFLOP/s on one GPU at `tp_ref`.
+    ///
+    /// A forward pass costs two FLOPs per parameter per token, and under
+    /// tensor parallelism each GPU carries `1/tp` of the parameters for all
+    /// tokens, so the per-GPU rate is just `tok_s_per_gpu x 2 x P` -- the tp
+    /// cancels.
+    pub fn achieved_tflops_per_gpu(&self) -> f64 {
+        self.tok_s_per_gpu * 2.0 * self.active_params_b * 1e9 / 1e12
+    }
+
+    /// Model FLOP utilisation: the fraction of the tensor cores this prefill
+    /// implementation actually reaches.
+    ///
+    /// This is the number that separates "the hardware is the limit" from "the
+    /// implementation is". Job 316849's p90 prefill of 50,925 tok/s over 8 GPUs
+    /// is 6,366 tok/s/GPU, 280 TFLOP/s, and MFU 14.2%. A capacity model that
+    /// reports only tok/s cannot say which of those two it is looking at, and
+    /// so cannot say whether a topology change or a kernel change is the move.
+    ///
+    /// 35% is a reasonable target for MoE prefill and would be 2.47x this
+    /// throughput -- more than the entire gap to the best measured competitor.
+    pub fn mfu(&self) -> f64 {
+        if self.peak_tflops_per_gpu <= 0.0 {
+            return 0.0;
+        }
+        self.achieved_tflops_per_gpu() / self.peak_tflops_per_gpu
+    }
+
     pub fn tok_s_per_gpu_at_tp(&self, tp: u32) -> f64 {
         let ref_ratio = ring_factor(self.tp_ref);
         if ref_ratio <= 0.0 {
@@ -358,6 +396,36 @@ impl CapacityModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MFU is what says whether the next move is a kernel or a topology.
+    ///
+    /// A forward pass is 2 FLOPs per active parameter per token, and tensor
+    /// parallelism cancels: each GPU holds 1/tp of the parameters and processes
+    /// every token, so per-GPU FLOP/s is tok_s_per_gpu x 2 x P regardless of tp.
+    #[test]
+    fn prefill_mfu_says_the_gap_is_implementation_not_hardware() {
+        let p = PrefillCalibration::default();
+        let expected_tflops = p.tok_s_per_gpu * 2.0 * p.active_params_b * 1e9 / 1e12;
+        assert!((p.achieved_tflops_per_gpu() - expected_tflops).abs() < 1e-6);
+
+        let mfu = p.mfu();
+        assert!(
+            mfu > 0.02 && mfu < 0.45,
+            "MFU {:.1}% is outside anything this workload has produced; either \
+             the calibration moved or active_params_b/peak_tflops_per_gpu is \
+             describing a different machine",
+            mfu * 100.0
+        );
+        // The headroom claim the roadmap rests on: this is an implementation
+        // gap wide enough to close the entire distance to the best measured
+        // competitor, and no P/D split touches it.
+        assert!(
+            0.35 / mfu > 1.5,
+            "only {:.2}x headroom to 35% MFU, so prefill kernels are no longer \
+             the largest lever and the roadmap needs re-deriving",
+            0.35 / mfu
+        );
+    }
 
     /// Job 316849 as a regression: 2 TP4 prefill workers, one TP8 decode
     /// worker, and upstream's single transfer buffer. The model must name the
