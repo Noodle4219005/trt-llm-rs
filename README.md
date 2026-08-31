@@ -202,6 +202,68 @@ prefill sustaining 45,845 tok/s and decode delivering 2,281 tok/s.
 **No run in this tree has yet passed the official criterion.** The 16.4 quoted
 at the top is an external reference and remains unmatched.
 
+## The A/B surface, and what the model says binds
+
+Every swappable implementation is one variable in
+`scripts/stage-d-235b-disagg.sbatch`, so a comparison is this stack against
+itself with one thing changed. Values come from the TensorRT-LLM source;
+availability from importing the module in the container.
+
+| Variable | Values | Note |
+|---|---|---|
+| `ATTN_BACKEND` | `TRTLLM` (default), `FLASHINFER`, `TRITON`, `VANILLA` | flashinfer is installed |
+| `MOE_BACKEND` | `AUTO` (default, resolves to CUTLASS on SM90), `DEEPGEMM`, `CUTLASS`, `TRTLLM`, … | `WIDEEP` needs `deep_ep`, absent |
+| `ALLREDUCE_STRATEGY` | `AUTO` (default), `NCCL`, `ONESHOT`, `TWOSHOT`, `LOWPRECISION`, … | `MNNVL` needs a fabric this cluster does not provision |
+| `XFER_BACKEND` | `UCX` (default), `NIXL`, `MPI`, `MOONCAKE` | mooncake absent |
+| `EXPERT_PARALLEL` | `1` (default), or a size | see below |
+| `KV_XFER_CONCURRENCY` | `16` (default) | upstream's default is **1** |
+| `CHUNKED_PREFILL` | `0` (default) | a prefill worker has no decode to interleave with |
+
+`scripts/validate_engine_yaml.py` runs before the workers start and builds the
+real `TorchLlmArgs`, which catches a misspelt key, a misspelt value in a field
+typed `str`, a shape the cross-field validators reject, and a correct value
+whose library is not importable.
+
+**Expert parallelism defaults to 1, and two sources agree.** Our own wiki
+records SGLang job 302350 reaching goodput 14.35 at gf 0.932 with EP1 on both
+sides, +43% over EP4. And TensorRT-LLM's own default is EP1: `mapping.py:112`
+sets `moe_ep_size = 1` and TP-shards the experts when neither is given. Passing
+`--expert-parallel-size 4` sets `moe_tp_size` to 1 — pure expert parallelism,
+no MoE tensor parallelism.
+
+**The KV transfer was serialised and nobody had noticed.**
+`baseTransBuffer.cpp:109` reads
+`getEnvRequestKVCacheConcurrent() ? getEnvKVCacheRecvBufferCount() : 1`, and
+that flag defaults to false, so the declared buffer count of 2 is never read.
+Send defaults to 1 as well. Job 316849 measured Time to Second Token at
+181.85 ms with p50 191 and p99 208 — far too tight for a queue under varying
+load — which is a 5.50 req/s ceiling against 4.08 measured.
+
+### Where the remaining throughput is
+
+`plan` prints the binding resource by name and the multiple that removing it
+would buy:
+
+```
+overall prefill MFU   17.3%
+  9.0% of wall time outside the forward pass    1.10x
+ 25.0% of kernel time in the TP all-reduce      1.33x
+ the remaining 68.2% runs at 25.3% MFU          1.97x to reach 50%
+```
+
+The 25%-of-kernel-time all-reduce reads like the thing to attack and is worth
+1.33x. Both cheap fixes together are 1.46x and leave the GEMMs at 25.3%. The
+lever is the grouped GEMM, which is a MoE backend question, and no P/D split
+changes MFU.
+
+**`plan` and `sim` currently disagree by 2x** — 14.30 against 7.53 req/s on the
+same config — and neither has been tuned to match the other. The simulator
+batches 1.118 prefill sequences because it refuses to fill the batch when
+deadlines are tight; the calibration behind `plan` came from a run with large
+batches. Until a measurement at a known prefill batch size settles it, treat
+`plan` as the optimistic bound and `sim` as the bound with that policy priced
+in.
+
 ## Build
 
 ```bash
