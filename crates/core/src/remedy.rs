@@ -52,6 +52,32 @@ pub struct Remedy {
     pub multiplier: f64,
     pub evidence: Evidence,
     pub because: &'static str,
+    /// Extra variables this remedy needs alongside its own, or "" for none.
+    /// Context parallelism changes the GPUs a worker owns, so it cannot be a
+    /// one-variable change however much a table wants it to be.
+    pub with: &'static str,
+}
+
+impl Remedy {
+    /// The line to run. A recommendation a reader has to translate into a
+    /// command is a recommendation they will translate wrong.
+    pub fn command(&self, script: &str) -> String {
+        let mut vars = format!("{}={}", self.knob, self.setting);
+        if !self.with.is_empty() {
+            vars.push(',');
+            vars.push_str(self.with);
+        }
+        // One line, because a wrapped command is a command someone will paste
+        // half of. 25a-hgpn143's NCCL hangs on its first collective, so the
+        // exclusion is not optional and belongs in the line rather than in a
+        // note beside it.
+        format!(
+            "{} {} {}",
+            "sbatch -p 16gpus -N 2 --gres=gpu:H200:8 -t 00:15:00",
+            "--exclude=25a-hgpn142,25a-hgpn143",
+            format_args!("--export=ALL,{vars} {script}")
+        )
+    }
 }
 
 impl CapacityModel {
@@ -99,6 +125,7 @@ impl CapacityModel {
             because: "upstream serialises the handoff to one buffer in each \
                       direction (baseTransBuffer.cpp:109); the pool size is the \
                       concurrency",
+            with: "",
         }]
     }
 
@@ -112,6 +139,7 @@ impl CapacityModel {
                 because: "SGLang job 302350 measured EP1 at +43% over EP4 on \
                           this model and hardware; removing a per-token \
                           all-to-all transfers between stacks",
+                with: "",
             },
             Remedy {
                 knob: "TORCH_COMPILE",
@@ -120,6 +148,7 @@ impl CapacityModel {
                 evidence: Evidence::Derived,
                 because: "the compute phase runs at 25.3% MFU and inductor is \
                           the codegen that would change the GEMMs",
+                with: "",
             },
             Remedy {
                 knob: "MOE_BACKEND",
@@ -129,13 +158,15 @@ impl CapacityModel {
                 because: "AUTO resolves to CUTLASS on SM90; SGLang's best run \
                           set its own MoE backend explicitly, which is a reason \
                           to try this one rather than evidence about it",
+                with: "",
             },
             Remedy {
                 knob: "ALLREDUCE_STRATEGY",
-                setting: "ONESHOT | TWOSHOT | LOWPRECISION",
+                setting: "LOWPRECISION",
                 multiplier: b.allreduce_worth,
                 evidence: Evidence::Derived,
                 because: "the TP all-reduce is 25% of prefill kernel time",
+                with: "",
             },
             Remedy {
                 knob: "HOST_DISPATCH_SPIN",
@@ -144,15 +175,17 @@ impl CapacityModel {
                 evidence: Evidence::Derived,
                 because: "9% of wall time is outside the forward pass; the \
                           stated cost is one spinning core and this node has 96",
+                with: "",
             },
             Remedy {
                 knob: "CONTEXT_PARALLEL",
-                setting: "2, with PREFILL_WORKERS=1 PREFILL_TP=4",
+                setting: "2",
                 multiplier: 1.0,
                 evidence: Evidence::Derived,
                 because: "splits the sequence rather than the weights, so it \
                           lowers prefill LATENCY -- which is what the TTFT gate \
                           is written in -- rather than throughput",
+                with: "PREFILL_WORKERS=1,PREFILL_TP=4",
             },
         ]
     }
@@ -167,14 +200,16 @@ impl CapacityModel {
                 because: "one TP8 decode worker delivered 815 tok/s where two \
                           TP4 workers reach 2170-2470; Qwen3-235B has 4 KV \
                           heads, so TP8 must duplicate them",
+                with: "",
             },
             Remedy {
                 knob: "CUDA_GRAPH_MAX_BATCH",
-                setting: "at or above the decode residency",
+                setting: "96",
                 multiplier: 1.0,
                 evidence: Evidence::Untested,
                 because: "CudaGraphConfig defaults max_batch_size to 0, so a \
                           capture that is merely enabled captures nothing",
+                with: "",
             },
         ]
     }
@@ -259,6 +294,39 @@ mod tests {
             compile.multiplier,
             allreduce.multiplier
         );
+    }
+
+    /// A recommendation a reader has to translate into a command is one they
+    /// will translate wrong -- and CONTEXT_PARALLEL is the proof, because it
+    /// changes how many GPUs a worker owns and is not a one-variable change
+    /// however much a table wants it to be.
+    #[test]
+    fn a_remedy_emits_a_command_that_carries_its_dependencies() {
+        let m = model();
+        let split = m.evaluate(4, 12, 4, 4);
+        let r = m.remedies(&split);
+
+        let cp = r
+            .iter()
+            .find(|x| x.knob == "CONTEXT_PARALLEL")
+            .expect("no context-parallel remedy");
+        let cmd = cp.command("scripts/stage-d-235b-disagg.sbatch");
+        assert!(cmd.contains("CONTEXT_PARALLEL=2"), "{cmd}");
+        assert!(
+            cmd.contains("PREFILL_WORKERS=1") && cmd.contains("PREFILL_TP=4"),
+            "context parallelism changes the worker's GPU count and the command \
+             did not say so: {cmd}"
+        );
+
+        // Every setting must be a value a shell can take, not a description.
+        for x in &r {
+            assert!(
+                !x.setting.contains(' '),
+                "{}={} is prose, not a value",
+                x.knob,
+                x.setting
+            );
+        }
     }
 
     /// A remedy that restates the current configuration is noise, and it lands

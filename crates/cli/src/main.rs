@@ -343,6 +343,10 @@ fn cmd_plan(cfg: &Config, total_gpus: u32, prefill_tp: &[u32], decode_tp: &[u32]
                 r.setting
             );
             println!("               {}", r.because);
+            println!(
+                "               {}",
+                r.command("scripts/stage-d-235b-disagg.sbatch")
+            );
         }
     }
 
