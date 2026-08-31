@@ -480,56 +480,9 @@ write_engine_yaml () {
 }
 write_engine_yaml "$OUT/engine-prefill.yaml" prefill
 write_engine_yaml "$OUT/engine-decode.yaml" decode
-attn_backend: ${ATTN_BACKEND}
-allreduce_strategy: ${ALLREDUCE_STRATEGY}
-enable_chunked_prefill: ${CHUNKED_PREFILL_BOOL}
-moe_config:
-  backend: ${MOE_BACKEND}
-cuda_graph_config:
-  # `mode` is the union discriminator, not decoration: cuda_graph_config is
-  # Optional[Annotated[Union[DecodeCudaGraphConfig, EncodeCudaGraphConfig],
-  # discriminator="mode"]], so a dict without it fails validation with
-  # "Unable to extract tag using discriminator 'mode'" and takes the worker
-  # with it. CudaGraphConfig.mode has a default of "decode", which is what
-  # makes omitting it look safe.
-  mode: decode
-  # max_batch_size defaults to 0 and enable_padding to False, so a capture that
-  # is merely "enabled" captures nothing and a varying decode batch misses what
-  # little it did capture. Decode residency at N=80 is ~23 per worker.
-  max_batch_size: ${CUDA_GRAPH_MAX_BATCH:-64}
-  enable_padding: true
-# Mandatory for disaggregated serving. Without it the prefill worker dies on the
-# first real request, not at startup. UCX rather than DEFAULT: DEFAULT resolves
-# to NIXL, which FileLocks a hardcoded path under the node-shared /tmp.
-cache_transceiver_config:
-  backend: ${XFER_BACKEND}
-  # THE FIX FOR THE DEADLOCK. Default is None (llm_args.py:3852). Jobs 315810,
-  # 315919, 315920 and 315954 all served ONE request fine and then deadlocked
-  # under concurrency, with the decode worker logging 60 s KV transfer timeouts
-  # while both sides sat idle -- the signature of a transfer resource pool, not
-  # a broken connection. Device isolation was ruled out in 315954 (gpus_per_node
-  # correct, cross-node, TP4, same deadlock).
-  #
-  # The corroboration is from another stack entirely: SGLang hit the identical
-  # symptom on the same model and the root cause was per-token RDMA generating
-  # O(tokens x layers) tiny requests -- 4000 tokens x 94 layers = ~376,000 per
-  # inference request -- fixed by a staging buffer that makes transfers bulk.
-  # max_tokens_in_buffer is TensorRT-LLM's equivalent knob.
-  #
-  # Sizing: Qwen3-235B at TP4 holds 1 KV head per rank, so
-  # 94 layers x 1 head x 128 dim x 2 (K+V) x 1 byte FP8 = ~24 KB per token per
-  # rank.
-  #
-  # This used to read 65536 with the note "holds ~16 concurrent 4000-token
-  # requests in flight". That was wrong, and wrong in the direction that hides
-  # itself: it sizes ONE buffer, and the pool holds one buffer unless
-  # TRTLLM_REQUEST_KV_CACHE_CONCURRENT is set (baseTransBuffer.cpp:109). So the
-  # 1.5 GB per rank bought room for sixteen requests and served exactly one,
-  # while the other fifteen blocked on a condition variable. One request per
-  # buffer, sixteen buffers, same footprint -- see KV_XFER_CONCURRENCY above.
-  max_tokens_in_buffer: ${MAX_TOKENS_IN_BUFFER}
-YAML
-echo "  engine.yaml:"; sed 's/^/    /' "$OUT/engine.yaml"
+for role in prefill decode; do
+  echo "  engine-$role.yaml:"; sed 's/^/    /' "$OUT/engine-$role.yaml"
+done
 
 PIDS=()
 cleanup () {

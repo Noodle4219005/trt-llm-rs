@@ -21,6 +21,13 @@ SIF=/work/u5727520/dynamo-qwen-smoke/images/tensorrtllm-runtime-1.4.1.sif
 SRC=/home/u5727520/trt-llm-rs
 TARGET=/work/u5727520/.trtllm-rs-target-cpu
 echo "node=$(hostname)  cores=$(nproc)  $(date -Is)"
+
+# The launcher's control flow, with the cluster stubbed. `bash -n` parses but
+# does not execute, and forty-nine lines of a dead heredoc body once survived
+# it across several commits.
+echo "--- launcher dry run ---"
+bash "$SRC/scripts/tests/dry-run-launcher.sh" || exit 31
+
 command -v apptainer >/dev/null || { echo "!!! no apptainer here"; exit 30; }
 apptainer exec --bind /work/u5727520,/home/u5727520,$HOME/.cargo,$HOME/.rustup "$SIF" \
   bash -lc "cd $SRC && export CARGO_TARGET_DIR=$TARGET CARGO_BUILD_JOBS=\$(nproc) \
