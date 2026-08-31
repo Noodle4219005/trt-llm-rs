@@ -28,6 +28,18 @@ use trtllm_core::{Millis, RequestId};
 #[derive(Clone, Copy, Debug)]
 pub struct RunningSeq {
     pub id: RequestId,
+    /// When the decode scheduler took responsibility for this sequence.
+    ///
+    /// Distinct from `first_token_ms`, and the distinction is load-bearing: in
+    /// disaggregated serving the first token is sampled by the PREFILL worker
+    /// and the KV handoff happens after it, so `now - first_token_ms` on a
+    /// freshly admitted sequence is 171 ms of transfer at the calibrated
+    /// bandwidth. Steering on that makes every admission look like a stall the
+    /// decode scheduler caused, and it throttles for a latency admission
+    /// cannot fix.
+    ///
+    /// Set by `admit`. Zero until then.
+    pub admitted_ms: Millis,
     pub first_token_ms: Millis,
     pub last_token_ms: Millis,
     pub tokens_emitted: u32,
@@ -38,6 +50,7 @@ impl RunningSeq {
     pub fn new(id: RequestId, first_token_ms: Millis, requested_tokens: u32) -> Self {
         Self {
             id,
+            admitted_ms: first_token_ms,
             first_token_ms,
             last_token_ms: first_token_ms,
             tokens_emitted: 1,
@@ -432,6 +445,13 @@ impl DecodeScheduler {
         }
     }
 
+    /// Take responsibility for a sequence as of `now`.
+    pub fn admit_at(&mut self, mut seq: RunningSeq, now: Millis) {
+        seq.admitted_ms = now;
+        seq.last_token_ms = seq.last_token_ms.max(now);
+        self.admit(seq)
+    }
+
     pub fn admit(&mut self, seq: RunningSeq) {
         self.running.insert(seq.id, seq);
     }
@@ -529,14 +549,22 @@ impl DecodeScheduler {
     /// `good_frac >= 0.90`: the ninetieth percentile is the request the score
     /// actually turns on.
     fn steering_itl_ms(&self, now: Millis) -> Option<f64> {
-        if self.running.is_empty() {
-            return None;
-        }
+        // Age since the LATER of the last token and admission.
+        //
+        // Excluding fresh sequences outright was tried and was wrong twice: it
+        // drops the starving request the controller exists to notice (its
+        // token count is 1 and never grows), and it did not move the
+        // simulator's goodput. Clamping at admission keeps every sequence in
+        // the sample while charging none of them for the handoff that happened
+        // before the decode scheduler could do anything about it.
         let mut samples: Vec<f64> = self
             .running
             .values()
-            .map(|seq| now - seq.last_token_ms)
+            .map(|seq| now - seq.last_token_ms.max(seq.admitted_ms))
             .collect();
+        if samples.is_empty() {
+            return None;
+        }
         samples.sort_by(|a, b| a.partial_cmp(b).expect("itl samples are finite"));
         let idx = (((samples.len() - 1) as f64) * 0.90).round() as usize;
         Some(samples[idx])
@@ -577,6 +605,7 @@ mod tests {
     fn seq_at(emitted: u32, elapsed: f64, requested: u32) -> RunningSeq {
         RunningSeq {
             id: RequestId(0),
+            admitted_ms: 0.0,
             first_token_ms: 0.0,
             last_token_ms: elapsed,
             tokens_emitted: emitted,
@@ -808,6 +837,7 @@ mod tests {
         // One request that has already burned its average.
         s.admit(RunningSeq {
             id: RequestId(7),
+            admitted_ms: 0.0,
             first_token_ms: 0.0,
             last_token_ms: 149.0 * 22.0,
             tokens_emitted: 150,

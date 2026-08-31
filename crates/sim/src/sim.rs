@@ -439,7 +439,7 @@ impl Simulator {
             // The sequence has been alive since its first token; the KV handoff
             // it just waited through is already part of its ITL average.
             seq.last_token_ms = self.now;
-            d.sched.admit(seq);
+            d.sched.admit_at(seq, self.now);
         }
     }
 
