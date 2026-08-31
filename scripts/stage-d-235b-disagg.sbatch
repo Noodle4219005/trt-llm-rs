@@ -254,6 +254,26 @@ set -uo pipefail
 # enable_min_latency is documented "Currently only used for Llama4".
 : "${ALLREDUCE_STRATEGY:=AUTO}"
 
+# EXPERT PARALLELISM, and the default here disagrees with our own strongest
+# measurement. Read this before running.
+#
+# The script passes --expert-parallel-size $tp, so EP == TP == 4, which is what
+# the user specified and what AIConfigurator recommends. But this wiki already
+# measured the alternative on the same model and hardware: SGLang job 302350
+# reached goodput 14.35 at gf 0.932 with EP1 on both sides -- dropping the
+# per-token all-to-all -- against the EP4 configuration, and recorded the
+# difference as +43%. It also set the MoE backend explicitly rather than
+# leaving it on auto.
+#
+# EP1 with TP4 does not mean replicating 128 experts per rank. It means the
+# expert weights are TP-sharded instead of EP-sharded: same memory, an
+# all-reduce in place of an all-to-all. TensorRT-LLM expresses that through
+# moe_tensor_parallel_size / moe_expert_parallel_size.
+#
+# Left at TP because that is what was asked for, and flagged rather than
+# flipped: EXPERT_PARALLEL=1 is a one-variable test of a 43% claim.
+: "${EXPERT_PARALLEL:=0}"   # 0 = follow TP; otherwise an explicit EP size
+
 # Off upstream, and left off deliberately. Chunked prefill exists to interleave
 # a long prompt with decode work in the same iteration, and a disaggregated
 # prefill worker has no decode work to interleave with. At ISL 4000 against
@@ -316,7 +336,52 @@ unset NATS_SERVER ETCD_ENDPOINTS ETCD_URL 2>/dev/null
 export DYN_LOG=info
 
 if [ "${CHUNKED_PREFILL}" = 1 ]; then CHUNKED_PREFILL_BOOL=true; else CHUNKED_PREFILL_BOOL=false; fi
-cat > "$OUT/engine.yaml" <<YAML
+
+# TWO FILES, because the two roles do not run the same phases.
+#
+# A disaggregated prefill worker never decodes, so a decode-mode CUDA graph on
+# it captures a phase it will not execute and charges the memory anyway. The
+# other direction is measured: SGLang's EP1 run had to pass
+# --disable-prefill-cuda-graph because the prefill graphs wanted 9.25 GiB and
+# OOMed, and the recorded fix was lowering the prefill memory fraction rather
+# than keeping them.
+#
+# Everything else -- the backends, the transceiver, chunked prefill -- is
+# shared, so it is written once into each file from the same variables.
+write_engine_yaml () {
+  local path="$1" role="$2"
+  {
+    echo "attn_backend: ${ATTN_BACKEND}"
+    echo "allreduce_strategy: ${ALLREDUCE_STRATEGY}"
+    echo "enable_chunked_prefill: ${CHUNKED_PREFILL_BOOL}"
+    echo "moe_config:"
+    echo "  backend: ${MOE_BACKEND}"
+    if [ "$role" = decode ]; then
+      echo "cuda_graph_config:"
+      # `mode` is the union discriminator, not decoration: cuda_graph_config is
+      # Optional[Annotated[Union[DecodeCudaGraphConfig, EncodeCudaGraphConfig],
+      # discriminator="mode"]], so a dict without it fails validation with
+      # "Unable to extract tag using discriminator 'mode'" and takes the worker
+      # with it. CudaGraphConfig.mode defaults to "decode", which is what makes
+      # omitting it look safe.
+      echo "  mode: decode"
+      # max_batch_size defaults to 0 and enable_padding to False, so enabling
+      # capture without setting them captures nothing, and without padding a
+      # varying decode batch misses what little it did capture.
+      echo "  max_batch_size: ${CUDA_GRAPH_MAX_BATCH}"
+      echo "  enable_padding: true"
+    fi
+    echo "cache_transceiver_config:"
+    # UCX rather than DEFAULT: DEFAULT resolves to NIXL, which FileLocks a
+    # hardcoded path under the node-shared /tmp.
+    echo "  backend: ${XFER_BACKEND}"
+    # One request per buffer; the buffer COUNT is what carries concurrency and
+    # it lives in TRTLLM_KVCACHE_*, not here. See KV_XFER_CONCURRENCY above.
+    echo "  max_tokens_in_buffer: ${MAX_TOKENS_IN_BUFFER}"
+  } > "$path"
+}
+write_engine_yaml "$OUT/engine-prefill.yaml" prefill
+write_engine_yaml "$OUT/engine-decode.yaml" decode
 attn_backend: ${ATTN_BACKEND}
 allreduce_strategy: ${ALLREDUCE_STRATEGY}
 enable_chunked_prefill: ${CHUNKED_PREFILL_BOOL}
@@ -468,7 +533,7 @@ await_free_gpus () {
 declare -A WPID
 
 launch_worker () {
-  local role="$1" node="$2" tag="$3" tp="$4" gpus="${5:-}" pp="${6:-1}" kvfrac adp=()
+  local role="$1" node="$2" tag="$3" tp="$4" gpus="${5:-}" pp="${6:-1}" kvfrac adp=() ep
   # 220.2 GiB of FP8 weights over TP2 is 110.1 GiB on a 131 GiB card, leaving
   # ~21 GiB; asking for 80% of that on top of activations is what killed all
   # four prefill workers in 316051 and 316287. A prefill worker computes KV and
@@ -501,7 +566,7 @@ launch_worker () {
   if [ "$role" = prefill ] && [ "${PREFILL_ATTENTION_DP}" = 1 ]; then
     adp=(--enable-attention-dp)
   fi
-  echo "  starting $tag: role=$role node=$node tp=$tp pp=$pp ep=$tp kv=$kvfrac adp=${#adp[@]} gpus=${gpus:-all}"
+  echo "  starting $tag: role=$role node=$node tp=$tp pp=$pp ep=$ep kv=$kvfrac adp=${#adp[@]} gpus=${gpus:-all}"
   srun -N1 -n1 -w "$node" --overlap apptainer exec --nv $BIND \
     ${gpus:+--env "CUDA_VISIBLE_DEVICES=$gpus"} \
     --env "PYTHONPATH=$STAGE" \
@@ -518,11 +583,11 @@ launch_worker () {
     python3 -m dynamo.trtllm \
       --model "$MODEL" --served-model-name Qwen/Qwen3-235B-A22B-Instruct-2507-FP8 \
       --tensor-parallel-size "$tp" --pipeline-parallel-size "$pp" \
-      --expert-parallel-size "$tp" ${adp[@]+"${adp[@]}"} \
+      --expert-parallel-size "$ep" ${adp[@]+"${adp[@]}"} \
       --free-gpu-memory-fraction "$kvfrac" \
       --max-seq-len "$MAX_SEQ_LEN" \
       --disaggregation-mode "$role" \
-      --extra-engine-args "$OUT/engine.yaml" \
+      --extra-engine-args "$OUT/engine-$role.yaml" \
       --discovery-backend file --event-plane zmq \
       > "$OUT/$tag.log" 2>&1 &
   WPID[$tag]=$!
@@ -643,7 +708,8 @@ NODE_P="${NODES[0]}"; NODE_D="${NODES[1]}"
 # 108 s of wall clock, which at 16 GPUs is ~29 SU.
 echo; echo "########## engine.yaml validation ##########"
 srun -N1 -n1 -w "$NODE_P" --overlap apptainer exec $BIND "$SIF" \
-  python3 "$SRC/scripts/validate_engine_yaml.py" "$OUT/engine.yaml" || exit 28
+  bash -c 'for f in "$0"/engine-*.yaml; do python3 "$1" "$f" || exit 28; done' \
+    "$OUT" "$SRC/scripts/validate_engine_yaml.py" || exit 28
 
 echo; echo "########## NCCL preflight ##########"
 nccl_preflight "$NODE_D" "$(( DECODE_WORKERS * DECODE_TP ))"
