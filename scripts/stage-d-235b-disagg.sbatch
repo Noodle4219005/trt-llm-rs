@@ -381,12 +381,13 @@ write_engine_yaml () {
     echo "  backend: ${MOE_BACKEND}"
     if [ "$role" = decode ]; then
       echo "cuda_graph_config:"
-      # `mode` is the union discriminator, not decoration: cuda_graph_config is
-      # Optional[Annotated[Union[DecodeCudaGraphConfig, EncodeCudaGraphConfig],
-      # discriminator="mode"]], so a dict without it fails validation with
-      # "Unable to extract tag using discriminator 'mode'" and takes the worker
-      # with it. CudaGraphConfig.mode defaults to "decode", which is what makes
-      # omitting it look safe.
+      # Explicit, though not required. cuda_graph_config is a union
+      # discriminated on `mode`, and validating the annotation directly rejects
+      # a dict without it -- but the engine does not validate the annotation
+      # directly: TorchLlmArgs.infer_cuda_graph_config_mode fills `mode` in
+      # first, so it resolves to DecodeCudaGraphConfig either way. An earlier
+      # version of this comment claimed omitting it kills the worker. It does
+      # not; the claim came from checking the wrong surface.
       echo "  mode: decode"
       # max_batch_size defaults to 0 and enable_padding to False, so enabling
       # capture without setting them captures nothing, and without padding a

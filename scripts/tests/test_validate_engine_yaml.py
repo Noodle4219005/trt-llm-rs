@@ -39,12 +39,20 @@ cache_transceiver_config:
         self.assertTrue(found)
         self.assertIn("cuda_graph_config", found[0])
 
-    def test_cuda_graph_config_without_its_discriminator_is_rejected(self):
-        """CudaGraphConfig.mode has a default, which is what makes omitting it
-        look safe; the union needs it as a tag and the worker dies without."""
-        found = problems("cuda_graph_config:\n  max_batch_size: 64")
-        self.assertTrue(found)
-        self.assertIn("discriminator", found[0])
+    def test_cuda_graph_config_without_its_discriminator_is_fine(self):
+        """A correction, kept as a test so the wrong version cannot return.
+
+        Validating the field's annotation with TypeAdapter rejects a dict
+        without `mode` -- "Unable to extract tag using discriminator 'mode'" --
+        and that is what this test used to assert. The engine does not do that.
+        TorchLlmArgs has a validator, infer_cuda_graph_config_mode, that fills
+        `mode` in before the union is discriminated, so the dict resolves to
+        DecodeCudaGraphConfig and the worker is fine.
+
+        The lesson is the one this whole validator exists for: checking the
+        annotation is not checking what the engine does. The check is now a
+        real TorchLlmArgs construction."""
+        self.assertEqual(problems("cuda_graph_config:\n  max_batch_size: 64"), [])
 
     def test_a_misspelt_value_in_a_str_field_is_rejected(self):
         """attn_backend is typed `str`, so nothing else catches FLASHINFR."""

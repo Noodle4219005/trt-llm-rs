@@ -2,6 +2,8 @@
 
 Four ways a setting can be wrong and produce no error at the point you write it:
 
+  0. A combination each field accepts and the engine as a whole does not. The
+     argument object is built here, so cross-field validators run.
   1. A misspelt key. `update_llm_args_with_extra_options` merges the YAML into
      the argument dict without checking anything, so `cuda_graph_confgi` and
      `totally_not_a_real_option: 7` are both accepted verbatim.
@@ -20,7 +22,7 @@ Ten seconds here, before the workers start.
 import sys
 
 import yaml
-from pydantic import TypeAdapter, ValidationError
+from pydantic import ValidationError
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 # Fields typed as plain `str` accept anything; these are the values that mean
@@ -58,15 +60,22 @@ def check(doc: dict) -> list[str]:
         hint = f" -- did you mean {', '.join(near)}?" if near else ""
         problems.append(f"{key}: not an option TensorRT-LLM has{hint}")
 
-    for key, value in doc.items():
-        if key in unknown:
-            continue
+    # Build the real argument object rather than checking fields one at a time.
+    # TorchLlmArgs requires only `model`, and constructing it runs the
+    # cross-field validators too -- which per-field TypeAdapter checks cannot
+    # reach. `cuda_graph_config` resolving to DecodeCudaGraphConfig with the
+    # values we asked for is a stronger statement than "the annotation accepts
+    # this dict".
+    known_doc = {k: v for k, v in doc.items() if k not in unknown}
+    if known_doc:
         try:
-            TypeAdapter(fields[key].annotation).validate_python(value)
+            TorchLlmArgs(model="/dev/null", **known_doc)
         except ValidationError as exc:
-            first = exc.errors()[0]
-            loc = ".".join(str(x) for x in first["loc"]) or key
-            problems.append(f"{key}: {loc} rejected -- {first['msg']}")
+            for err in exc.errors():
+                loc = ".".join(str(x) for x in err["loc"]) or "?"
+                problems.append(f"{loc} rejected -- {err['msg']}")
+        except Exception as exc:  # a validator that raises something else
+            problems.append(f"engine args rejected -- {type(exc).__name__}: {exc}")
 
     for key, allowed in ALLOWED.items():
         chosen = doc.get(key)
