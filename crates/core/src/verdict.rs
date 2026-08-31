@@ -49,6 +49,24 @@ pub enum Diagnosis {
     NothingServed,
 }
 
+impl Diagnosis {
+    /// The resource this diagnosis points at, if it points at one.
+    ///
+    /// A gate maps to a side because the gates are written in different
+    /// quantities: inter-token latency is decode's, time-to-first-token is
+    /// prefill's. That is not an inference, it is what the metrics mean --
+    /// which is why job 316849's ITL failure was a decode problem even though
+    /// the deployment's decode engine was 6% utilised.
+    pub fn implicates(self) -> Option<Bottleneck> {
+        match self {
+            Diagnosis::Met | Diagnosis::NothingServed => None,
+            Diagnosis::ItlGate { .. } => Some(Bottleneck::Decode),
+            Diagnosis::TtftGate { .. } => Some(Bottleneck::Prefill),
+            Diagnosis::ThroughputShortfall { implicates, .. } => Some(implicates),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Verdict {
     pub predicted_goodput_req_s: f64,
@@ -176,6 +194,34 @@ impl MeasuredRun {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A gate names a side. ITL is decode's quantity and TTFT is prefill's --
+    /// not an inference but what the metrics are, which is why 316849's ITL
+    /// failure was decode's problem even though its decode engine was 6%
+    /// utilised.
+    #[test]
+    fn a_failed_gate_points_at_the_side_that_owns_it() {
+        assert_eq!(
+            Diagnosis::ItlGate {
+                measured_ms: 91.0,
+                budget_ms: 20.0
+            }
+            .implicates(),
+            Some(Bottleneck::Decode)
+        );
+        assert_eq!(
+            Diagnosis::TtftGate {
+                measured_ms: 5000.0,
+                budget_ms: 3000.0
+            }
+            .implicates(),
+            Some(Bottleneck::Prefill)
+        );
+        // A run that met its prediction, or served nothing, points nowhere --
+        // the second because a failure is not a measurement of anything.
+        assert_eq!(Diagnosis::Met.implicates(), None);
+        assert_eq!(Diagnosis::NothingServed.implicates(), None);
+    }
 
     /// Job 316849's export, verbatim, as a regression on the diagnosis.
     fn job_316849() -> MeasuredRun {

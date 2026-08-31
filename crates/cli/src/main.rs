@@ -180,6 +180,21 @@ fn main() -> Result<()> {
             );
             println!("{}", v.summary());
             println!();
+            // Which deployment this is being judged against. The export does
+            // not record the topology, so the comparison uses the configured
+            // one -- and a verdict against the wrong configuration is worse
+            // than none. Job 316849's artifact was 2P1D on a TP8 decode worker;
+            // read against the current 2P2D/TP4 default, the measured remedy
+            // for its failure is filtered out as already applied.
+            println!(
+                "  assuming {}P{}D, prefill TP{}, decode TP{} -- pass --expect \
+                 if the run was something else",
+                cfg.topology.prefill_workers,
+                cfg.topology.decode_workers,
+                cfg.topology.prefill_tp,
+                cfg.topology.decode_tp
+            );
+            println!();
             println!(
                 "  goodput      {:>8.2} measured   {:>8.2} predicted",
                 v.measured.goodput_req_s, v.predicted_goodput_req_s
@@ -197,6 +212,31 @@ fn main() -> Result<()> {
                 v.measured.itl_avg_ms, cfg.slo.itl_ms
             );
             println!("  requests     {:>8.0}", v.measured.request_count);
+
+            // What to try next. The diagnosis already names a resource; the
+            // remedies for that resource are the answer, and printing them here
+            // is the difference between a verdict and a next step.
+            if let Some(b) = v.diagnosis.implicates() {
+                let implicated = trtllm_core::capacity::PdSplit {
+                    bottleneck: b,
+                    ..split
+                };
+                let remedies = model.remedies(&implicated);
+                if remedies.is_empty() {
+                    println!();
+                    println!("Every remedy this model knows for {b:?} is already applied.");
+                } else {
+                    println!();
+                    println!("Next, for {b:?}, strongest evidence first:");
+                    for r in remedies {
+                        println!("  {:<12} {}={}", r.evidence.label(), r.knob, r.setting);
+                        println!(
+                            "               {}",
+                            r.command("scripts/stage-d-235b-disagg.sbatch")
+                        );
+                    }
+                }
+            }
         }
         Command::Sim {
             concurrency,
