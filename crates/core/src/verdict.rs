@@ -35,6 +35,15 @@ pub enum Diagnosis {
     Met,
     /// Requests were served but too slowly between tokens.
     ItlGate { measured_ms: f64, budget_ms: f64 },
+    /// Both gates missed. Distinct from either alone, because "the other one
+    /// was fine" is the useful half of a single-gate diagnosis and saying it
+    /// when it is false points the reader at the wrong side.
+    BothGates {
+        itl_ms: f64,
+        itl_budget_ms: f64,
+        ttft_p90_ms: f64,
+        ttft_budget_ms: f64,
+    },
     /// Requests waited too long for their first token.
     TtftGate { measured_ms: f64, budget_ms: f64 },
     /// Both gates passed and the rate still fell short, which points at a
@@ -61,6 +70,18 @@ impl Diagnosis {
         match self {
             Diagnosis::Met | Diagnosis::NothingServed => None,
             Diagnosis::ItlGate { .. } => Some(Bottleneck::Decode),
+            // Point at the larger miss. Fixing the 5% one first leaves the
+            // 70% one untouched.
+            Diagnosis::BothGates {
+                itl_ms,
+                itl_budget_ms,
+                ttft_p90_ms,
+                ttft_budget_ms,
+            } => Some(if ttft_p90_ms / ttft_budget_ms > itl_ms / itl_budget_ms {
+                Bottleneck::Prefill
+            } else {
+                Bottleneck::Decode
+            }),
             Diagnosis::TtftGate { .. } => Some(Bottleneck::Prefill),
             Diagnosis::ThroughputShortfall { implicates, .. } => Some(implicates),
         }
@@ -97,9 +118,18 @@ impl Verdict {
             Diagnosis::NothingServed
         } else if ratio >= 1.0 - tolerance {
             Diagnosis::Met
+        } else if measured.itl_avg_ms > slo.itl_ms && measured.ttft_p90_ms > slo.ttft_ms {
+            // Both. Job 325590 missed ITL by 5% and TTFT by 70%, and the
+            // single-gate branch below reported "TTFT was not the problem" --
+            // which was the opposite of true and pointed at decode when the
+            // larger miss was on the other side.
+            Diagnosis::BothGates {
+                itl_ms: measured.itl_avg_ms,
+                itl_budget_ms: slo.itl_ms,
+                ttft_p90_ms: measured.ttft_p90_ms,
+                ttft_budget_ms: slo.ttft_ms,
+            }
         } else if measured.itl_avg_ms > slo.itl_ms {
-            // Checked before TTFT because ITL is charged per token and so
-            // dominates a request's fate once it is missed at all.
             Diagnosis::ItlGate {
                 measured_ms: measured.itl_avg_ms,
                 budget_ms: slo.itl_ms,
@@ -152,6 +182,24 @@ impl Verdict {
             } => format!(
                 "TTFT GATE: p90 {measured_ms:.0} ms against a {budget_ms:.0} ms \
                  budget. Tokens came fast enough once they started."
+            ),
+            Diagnosis::BothGates {
+                itl_ms,
+                itl_budget_ms,
+                ttft_p90_ms,
+                ttft_budget_ms,
+            } => format!(
+                "BOTH GATES: ITL {itl_ms:.1} ms against {itl_budget_ms:.0} \
+                 ({:.2}x over) and TTFT p90 {ttft_p90_ms:.0} ms against \
+                 {ttft_budget_ms:.0} ({:.2}x over). Neither side is fine; the \
+                 larger miss is {}.",
+                itl_ms / itl_budget_ms,
+                ttft_p90_ms / ttft_budget_ms,
+                if ttft_p90_ms / ttft_budget_ms > itl_ms / itl_budget_ms {
+                    "prefill"
+                } else {
+                    "decode"
+                }
             ),
             Diagnosis::ThroughputShortfall {
                 measured_req_s,
@@ -321,5 +369,76 @@ mod tests {
         let doc: serde_json::Value = serde_json::from_str(r#"{"goodput": {"avg": 1.0}}"#).unwrap();
         let err = MeasuredRun::from_aiperf_json(&doc).expect_err("should not parse");
         assert!(err.contains("request_throughput"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod both_gates_tests {
+    use super::*;
+
+    /// Job 325590, verbatim. The five corrected settings took throughput from
+    /// 4.08 to 13.71 req/s and ITL from 91.1 to 21.1 ms, and then both gates
+    /// missed -- ITL by 5%, TTFT by 70%. The single-gate branch reported
+    /// "TTFT was not the problem", which was false and pointed at the smaller
+    /// miss.
+    fn job_325590() -> MeasuredRun {
+        MeasuredRun {
+            goodput_req_s: 0.22,
+            request_throughput_req_s: 13.71,
+            output_token_throughput: 2738.0,
+            ttft_avg_ms: 4863.0,
+            ttft_p90_ms: 5113.0,
+            itl_avg_ms: 21.1,
+            request_count: 1754.0,
+        }
+    }
+
+    #[test]
+    fn two_failed_gates_are_not_reported_as_one() {
+        let v = Verdict::assess(
+            job_325590(),
+            14.30,
+            &Slo::default(),
+            Bottleneck::Decode,
+            0.15,
+        );
+        assert!(
+            matches!(v.diagnosis, Diagnosis::BothGates { .. }),
+            "got {:?}",
+            v.diagnosis
+        );
+        let s = v.summary();
+        assert!(!s.contains("was not the problem"), "{s}");
+        assert!(s.contains("Neither side is fine"), "{s}");
+    }
+
+    /// And it must point at the larger miss. Fixing 5% first leaves 70%.
+    #[test]
+    fn the_larger_miss_is_the_one_named() {
+        let v = Verdict::assess(
+            job_325590(),
+            14.30,
+            &Slo::default(),
+            Bottleneck::Decode,
+            0.15,
+        );
+        assert_eq!(
+            v.diagnosis.implicates(),
+            Some(Bottleneck::Prefill),
+            "TTFT missed by 70% and ITL by 5%; prefill is the larger"
+        );
+        assert!(v.summary().contains("prefill"), "{}", v.summary());
+    }
+
+    /// One gate alone must still read as one gate -- 316849 missed ITL by 4.6x
+    /// with TTFT p90 inside by 19 ms, and "TTFT was not the problem" was the
+    /// useful half of that diagnosis.
+    #[test]
+    fn a_single_failed_gate_still_says_the_other_one_held() {
+        let mut m = job_325590();
+        m.ttft_p90_ms = 2980.9;
+        let v = Verdict::assess(m, 14.30, &Slo::default(), Bottleneck::Decode, 0.15);
+        assert!(matches!(v.diagnosis, Diagnosis::ItlGate { .. }));
+        assert!(v.summary().contains("TTFT was not the problem"));
     }
 }
