@@ -36,7 +36,10 @@ apptainer exec --bind /work/u5727520,/home/u5727520,$HOME/.cargo,$HOME/.rustup "
     echo '--- clippy ---' && \
     cargo clippy --workspace --exclude trtllm-pyhost --exclude trtllm-pyext \
       --all-targets 2>&1 | grep -E '^(warning|error)' | head -20 && \
+    PYO3_BUILD_EXTENSION_MODULE=1 cargo clippy -p trtllm-pyext --all-targets \
+      2>&1 | grep -E '^(warning|error)' | head -10 && \
     echo '--- test ---' && \
+    PYO3_BUILD_EXTENSION_MODULE=1 cargo test -p trtllm-pyext --lib 2>&1 | tail -4 && \
     cargo test --workspace --exclude trtllm-pyhost --exclude trtllm-pyext \
       --all-targets --no-fail-fast 2>&1 | tail -200 && \
     echo && echo '========== plan ==========' && \

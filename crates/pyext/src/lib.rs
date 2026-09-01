@@ -66,7 +66,7 @@ use trtllm_sched::ItlController;
 
 mod decide;
 
-use decide::{decide_indices, validate_lengths, DecideInput};
+use decide::{decide_indices, validate_lengths, DecideInput, DecodeOrder};
 
 /// A Rust-backed capacity decision for TensorRT-LLM's `SimpleScheduler`,
 /// standing in for its `capacity_scheduler` (not the whole `RequestScheduler`
@@ -80,6 +80,18 @@ pub struct RustScheduler {
     max_batch_size: usize,
     max_num_tokens: usize,
     kv_total_blocks: usize,
+    /// The scored mean-ITL budget. The controller steers on it and the slack
+    /// ordering ranks on it, so it must be the same number in both places.
+    itl_budget_ms: f64,
+    /// Which running request gives up its step when the cap binds. Read from
+    /// TRTLLM_RS_DECODE_ORDER so it can be A/B'd without a rebuild -- the
+    /// worker binary is staged into a container and a rebuild is the
+    /// expensive part of a comparison.
+    decode_order: DecodeOrder,
+    /// Free blocks below which a request that has not started is held back.
+    /// `kv_free_blocks` crossed the ABI from the first version and was stored
+    /// and never read.
+    kv_watermark_blocks: usize,
     controller: ItlController,
     admitted_total: u64,
     paused_total: u64,
@@ -104,10 +116,23 @@ impl RustScheduler {
         // is enforced independently by `decide`, so an initial cap this high
         // never itself admits more than the batch allows.
         let max_cap = (max_batch_size.max(1)) as f64;
+        let decode_order = match std::env::var("TRTLLM_RS_DECODE_ORDER").as_deref() {
+            Ok("arrival") => DecodeOrder::Arrival,
+            // Anything else, including unset and a typo, gets the default.
+            // A misspelt policy that silently disabled the scheduler would be
+            // the worst of both: no benefit and no signal.
+            _ => DecodeOrder::Slack,
+        };
         RustScheduler {
             max_batch_size,
             max_num_tokens,
             kv_total_blocks,
+            itl_budget_ms,
+            decode_order,
+            // 5% of the pool, matching KvConfig::admission_watermark, which
+            // the simulator and the worker have both used since the beginning
+            // while the live path did not.
+            kv_watermark_blocks: kv_total_blocks / 20,
             controller: ItlController::new(itl_budget_ms, max_cap, 1.0, max_cap),
             admitted_total: 0,
             paused_total: 0,
@@ -149,11 +174,9 @@ impl RustScheduler {
         )
         .map_err(PyValueError::new_err)?;
 
-        // `tokens_generated`, `max_new_tokens`, and `now_ms` are part of the
-        // fixed ABI but the admission rules given for this crate
-        // (ItlController cap, max_batch_size, the shared max_num_tokens
-        // budget, arrival-then-id ordering) do not consume them beyond the
-        // length check above; they are otherwise reserved.
+        // These three were length-checked and discarded as "reserved" while
+        // the ordering was arrival-then-id. They are what the slack ordering
+        // needs, and the bridge has been computing them the whole time.
         let generation_cap = self.controller.cap().max(0.0) as usize;
         let input = DecideInput {
             ids: &ids,
@@ -165,6 +188,13 @@ impl RustScheduler {
             max_batch_size: self.max_batch_size,
             max_num_tokens: self.max_num_tokens,
             generation_cap,
+            tokens_generated: &tokens_generated,
+            max_new_tokens: &max_new_tokens,
+            now_ms,
+            itl_budget_ms: self.itl_budget_ms,
+            decode_order: self.decode_order,
+            kv_free_blocks,
+            kv_watermark_blocks: self.kv_watermark_blocks,
         };
         let (fitting_indices, paused_indices) = decide_indices(&input);
 
