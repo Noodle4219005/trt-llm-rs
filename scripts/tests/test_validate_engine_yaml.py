@@ -66,12 +66,32 @@ cache_transceiver_config:
         self.assertTrue(found)
         self.assertIn("deep_ep", found[0])
 
-    def test_deepgemm_is_available_and_must_not_be_gated(self):
-        """DEEPGEMM does not need the PyPI deep_gemm. TensorRT-LLM bundles
-        tensorrt_llm.deep_gemm, which fused_moe_deepgemm.py imports and which
-        is present here. Gating on the top-level name rejected a backend that
-        works."""
-        self.assertEqual(problems("moe_config:\n  backend: DEEPGEMM"), [])
+    def test_deepgemm_import_gate_was_the_wrong_question(self):
+        """This test asserted the opposite twice, and the second time was worse.
+
+        First it gated DEEPGEMM on `import deep_gemm`, which fails: TRT-LLM
+        bundles its own `tensorrt_llm.deep_gemm`. So the gate was corrected to
+        the bundled module and a test was written asserting DEEPGEMM validates
+        -- this test. Both were answering "is the library present" when the
+        constraint is "does this GPU run these kernels", and TRT-LLM's
+        DeepGemmFusedMoE refuses anything but SM100/103.
+
+        The bundled module still imports on an H200. It is the backend that
+        refuses, at construction, inside the allocation. Import success is not
+        support, and a gate that only asks about imports will keep passing
+        things that cannot run.
+        """
+        import importlib
+
+        importlib.import_module("tensorrt_llm.deep_gemm")
+
+        p = problems("moe_config:\n  backend: DEEPGEMM")
+        self.assertTrue(
+            p, "the module imports, so only a hardware check can reject this"
+        )
+        self.assertNotIn(
+            "not installed", " ".join(p), "it is installed; that was never the issue"
+        )
 
     def test_a_backend_whose_library_is_present_is_accepted(self):
         self.assertEqual(problems("attn_backend: FLASHINFER"), [])
@@ -117,3 +137,29 @@ cache_transceiver_config:
             "allreduce_strategy: LOWPRECISION",
         ):
             self.assertEqual(problems(body), [], body)
+
+    def test_a_backend_this_gpu_cannot_run_is_refused(self):
+        """DEEPGEMM was recommended in this repo for an H200 on the strength of
+        a neighbouring stack's deep_gemm result. That stack was vLLM, whose
+        DeepGEMM is not TRT-LLM's DeepGemmFusedMoE, and TRT-LLM's refuses
+        anything but SM100/103. The import gate passed it because
+        tensorrt_llm.deep_gemm ships regardless. Import success is not
+        support."""
+        p = problems("moe_config:\n  backend: DEEPGEMM")
+        self.assertTrue(p, "DEEPGEMM must not pass unchecked")
+        joined = " ".join(p)
+        self.assertIn("SM100", joined, joined)
+
+    def test_an_unavailable_gpu_is_reported_as_unchecked_not_as_supported(self):
+        """A validator that passes on a login node because it cannot see a GPU
+        is worse than one that does not check: it converts 'unknown' into
+        'fine'."""
+        p = problems("moe_config:\n  backend: TRTLLM")
+        self.assertTrue(p)
+        self.assertRegex(" ".join(p), r"NOT checked|SM\d+")
+
+    def test_the_hopper_default_passes(self):
+        """CUTLASS is the only MoE backend an H200 with an fp8 checkpoint can
+        run, and AUTO resolves to it. Both must validate everywhere."""
+        self.assertEqual(problems("moe_config:\n  backend: CUTLASS"), [])
+        self.assertEqual(problems("moe_config:\n  backend: AUTO"), [])

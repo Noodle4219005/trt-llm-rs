@@ -39,6 +39,57 @@ ALLOWED = {
 # is present with every symbol that path uses. Gating on the top-level name
 # rejected a backend that works -- the same class of error as reading a
 # declared default instead of the branch that consumes it.
+# A second kind of gate, and the distinction is the whole point: GATED asks
+# "is the library installed", SM_GATED asks "does this GPU run these kernels".
+# They are different questions and this file conflated them until DEEPGEMM was
+# recommended for an H200. `import tensorrt_llm.deep_gemm` succeeds there --
+# the module ships regardless -- and DeepGemmFusedMoE then refuses at
+# construction with "requires SM100 or SM103" (fused_moe_deepgemm.py:751),
+# inside the GPU allocation, which is the expensive place to find out.
+#
+# Values are (predicate on sm, explanation). Cited by file:line so a reader can
+# check the claim instead of trusting the table.
+SM_GATED = {
+    ("moe_config", "backend", "DEEPGEMM"): (
+        lambda sm: sm in (100, 103),
+        "DeepGemmFusedMoE requires SM100 or SM103 (fused_moe_deepgemm.py:751). "
+        "vLLM's deep_gemm is a different implementation; a result from that "
+        "stack does not transfer to this flag.",
+    ),
+    ("moe_config", "backend", "TRTLLM"): (
+        lambda sm: sm in (100, 103),
+        "TRTLLMGenFusedMoE requires SM100 or SM103 (fused_moe_trtllm_gen.py:157).",
+    ),
+    ("moe_config", "backend", "MARLIN"): (
+        lambda sm: sm == 90,
+        "MarlinFusedMoE is SM90-only and additionally requires an NVFP4 "
+        "checkpoint (fused_moe_marlin.py:73,78).",
+    ),
+    ("moe_config", "backend", "TRITON"): (
+        lambda sm: sm == 90,
+        "TritonFusedMoE is SM90-only (fused_moe_triton.py:1499).",
+    ),
+}
+
+
+def _sm_version():
+    """Compute capability x10, or None when there is no GPU to ask.
+
+    None means "not checked", never "supported": a validator that passes on a
+    login node because it cannot see a GPU would be worse than one that does
+    not check at all.
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        major, minor = torch.cuda.get_device_capability()
+        return major * 10 + minor
+    except Exception:
+        return None
+
+
 GATED = {
     ("moe_config", "backend", "DEEPGEMM"): "tensorrt_llm.deep_gemm",
     ("moe_config", "backend", "MEGAMOE_DEEPGEMM"): "tensorrt_llm.deep_gemm",
@@ -83,6 +134,20 @@ def check(doc: dict) -> list[str]:
             problems.append(
                 f"{key}={chosen!r} is not one of {', '.join(allowed)} "
                 f"(the field is typed `str`, so nothing else catches this)")
+
+    sm = _sm_version()
+    for (key, sub, want), (ok, why) in SM_GATED.items():
+        chosen = doc.get(key) if sub is None else (doc.get(key) or {}).get(sub)
+        if chosen != want:
+            continue
+        where = key if sub is None else f"{key}.{sub}"
+        if sm is None:
+            problems.append(
+                f"{where} = {want!r}: no GPU visible here, so this was NOT "
+                f"checked. On the wrong hardware it fails at construction. {why}"
+            )
+        elif not ok(sm):
+            problems.append(f"{where} = {want!r} on SM{sm}: {why}")
 
     for (key, sub, want), module in GATED.items():
         chosen = doc.get(key) if sub is None else (doc.get(key) or {}).get(sub)

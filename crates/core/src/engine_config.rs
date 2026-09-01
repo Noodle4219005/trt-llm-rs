@@ -109,8 +109,22 @@ impl Default for SpeculationConfig {
 impl EngineConfig {
     pub const ATTN_BACKENDS: &'static [&'static str] =
         &["TRTLLM", "FLASHINFER", "TORCH", "VANILLA"];
+    /// Exactly the Literal in MoeConfig.backend. This list says what TRT-LLM
+    /// accepts as a name; `validate_for` says what this machine can run. Two
+    /// different questions, and collapsing them is what let DEEPGEMM be
+    /// recommended for an H200.
     pub const MOE_BACKENDS: &'static [&'static str] = &[
-        "AUTO", "CUTLASS", "DEEPGEMM", "TRTLLM", "TRITON", "VANILLA", "WIDEEP",
+        "AUTO",
+        "CUTLASS",
+        "CUTEDSL",
+        "WIDEEP",
+        "TRTLLM",
+        "DEEPGEMM",
+        "DENSEGEMM",
+        "VANILLA",
+        "TRITON",
+        "MARLIN",
+        "MEGAMOE_DEEPGEMM",
     ];
     pub const ALLREDUCE_STRATEGIES: &'static [&'static str] = &[
         "AUTO",
@@ -235,5 +249,180 @@ mod tests {
         };
         let e = c.validate().expect_err("should be refused");
         assert!(e.contains("have not been run together"), "{e}");
+    }
+}
+
+/// What this machine and this checkpoint can actually run.
+///
+/// A knob a user can set is not a knob a user can use. TRT-LLM's backends
+/// refuse at construction time, inside the GPU allocation, with an exception
+/// that names the SM version -- so the same check belongs here, where it costs
+/// nothing.
+///
+/// This exists because it caught a live mistake. `MOE_BACKEND=DEEPGEMM` was
+/// recommended in this repo on the strength of a neighbouring stack going from
+/// goodput 17.0 to 19.8 with `deep_gemm`. That stack was vLLM, and vLLM's
+/// DeepGEMM integration is not TRT-LLM's DeepGemmFusedMoE, which refuses
+/// anything but SM100/103. The gate that was supposed to catch it checked that
+/// `tensorrt_llm.deep_gemm` imports -- and it does. Import success is not
+/// support.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hardware {
+    /// Compute capability times 10: 90 for H200, 100 for B200.
+    pub sm: u32,
+    /// Checkpoint quantisation: "fp8", "nvfp4", "fp16".
+    pub quant: String,
+}
+
+impl Hardware {
+    /// nano4: H200 SM90, Qwen3-235B-A22B-Instruct-2507-FP8.
+    pub fn h200_fp8() -> Self {
+        Hardware {
+            sm: 90,
+            quant: "fp8".into(),
+        }
+    }
+}
+
+impl EngineConfig {
+    /// Whether the selected kernels exist for this hardware and checkpoint.
+    ///
+    /// Every rule below is a `raise` in the TRT-LLM source, cited by file and
+    /// line, so a reader can check the claim rather than trust this table.
+    pub fn validate_for(&self, hw: &Hardware) -> Result<(), String> {
+        self.validate()?;
+
+        match self.moe_backend.as_str() {
+            // fused_moe_deepgemm.py:751 -- `sm_version not in {100, 103}`.
+            "DEEPGEMM" | "MEGAMOE_DEEPGEMM" if hw.sm != 100 && hw.sm != 103 => {
+                return Err(format!(
+                    "moe_backend = \"DEEPGEMM\" needs SM100 or SM103 and this \
+                     is SM{}. TRT-LLM's DeepGemmFusedMoE refuses at \
+                     construction (fused_moe_deepgemm.py:751). vLLM's \
+                     deep_gemm is a different implementation and its result on \
+                     this model does not transfer to this flag. On SM90 with \
+                     an fp8 checkpoint, CUTLASS is the only MoE backend that \
+                     runs, and AUTO already selects it.",
+                    hw.sm
+                ));
+            }
+            // fused_moe_trtllm_gen.py:157 -- same gate.
+            "TRTLLM" if hw.sm != 100 && hw.sm != 103 => {
+                return Err(format!(
+                    "moe_backend = \"TRTLLM\" needs SM100 or SM103 and this is \
+                     SM{} (fused_moe_trtllm_gen.py:157).",
+                    hw.sm
+                ));
+            }
+            // fused_moe_marlin.py:73,78 -- NVFP4 only, and SM90 only.
+            "MARLIN" => {
+                if hw.quant != "nvfp4" {
+                    return Err(format!(
+                        "moe_backend = \"MARLIN\" needs an NVFP4 checkpoint and \
+                         this one is {} (fused_moe_marlin.py:73).",
+                        hw.quant
+                    ));
+                }
+                if hw.sm != 90 {
+                    return Err(format!(
+                        "moe_backend = \"MARLIN\" is SM90-only and this is SM{} \
+                         (fused_moe_marlin.py:78).",
+                        hw.sm
+                    ));
+                }
+            }
+            // fused_moe_triton.py:1499, and it additionally requires
+            // swiglu_gptoss_style, which Qwen3 is not.
+            "TRITON" if hw.sm != 90 => {
+                return Err(format!(
+                    "moe_backend = \"TRITON\" is SM90-only and this is SM{} \
+                     (fused_moe_triton.py:1499).",
+                    hw.sm
+                ));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod hardware_tests {
+    use super::*;
+
+    /// The mistake this whole mechanism exists for, pinned so it cannot come
+    /// back: DEEPGEMM was recommended for an H200 on the strength of a vLLM
+    /// result, and TRT-LLM's DeepGemmFusedMoE refuses anything but SM100/103.
+    #[test]
+    fn deepgemm_is_refused_on_hopper_and_the_message_says_why() {
+        let c = EngineConfig {
+            moe_backend: "DEEPGEMM".into(),
+            ..EngineConfig::default()
+        };
+        let e = c
+            .validate_for(&Hardware::h200_fp8())
+            .expect_err("DEEPGEMM must not pass on SM90");
+        assert!(e.contains("SM100"), "{e}");
+        assert!(
+            e.contains("vLLM"),
+            "the message must say why the transferred evidence does not apply: {e}"
+        );
+        // And it must pass where it does work, or this is just a ban.
+        let b200 = Hardware {
+            sm: 100,
+            quant: "nvfp4".into(),
+        };
+        c.validate_for(&b200).expect("DEEPGEMM is fine on SM100");
+    }
+
+    /// MARLIN is SM90-only, which makes it look like the Hopper choice until
+    /// you read the line above it: NVFP4 only, and this checkpoint is fp8.
+    #[test]
+    fn marlin_is_refused_for_the_checkpoint_not_the_gpu() {
+        let c = EngineConfig {
+            moe_backend: "MARLIN".into(),
+            ..EngineConfig::default()
+        };
+        let e = c.validate_for(&Hardware::h200_fp8()).expect_err("fp8");
+        assert!(
+            e.contains("NVFP4"),
+            "on SM90 the binding constraint is the checkpoint, not the GPU: {e}"
+        );
+    }
+
+    /// What is left. AUTO resolves to CUTLASS on SM90 and CUTLASS is the only
+    /// MoE backend an H200 with an fp8 checkpoint can run, so the default has
+    /// no alternative to be measured against on this hardware.
+    #[test]
+    fn cutlass_is_the_only_moe_backend_h200_fp8_can_run() {
+        let hw = Hardware::h200_fp8();
+        for good in ["AUTO", "CUTLASS"] {
+            EngineConfig {
+                moe_backend: good.into(),
+                ..EngineConfig::default()
+            }
+            .validate_for(&hw)
+            .unwrap_or_else(|e| panic!("{good} should run on H200 fp8: {e}"));
+        }
+        for bad in ["DEEPGEMM", "TRTLLM", "MARLIN"] {
+            assert!(
+                EngineConfig {
+                    moe_backend: bad.into(),
+                    ..EngineConfig::default()
+                }
+                .validate_for(&hw)
+                .is_err(),
+                "{bad} must be refused on H200 fp8"
+            );
+        }
+    }
+
+    /// The defaults must run on the hardware this repo targets, or the first
+    /// thing a user meets is an error about a file they never edited.
+    #[test]
+    fn the_defaults_run_on_the_target_hardware() {
+        EngineConfig::default()
+            .validate_for(&Hardware::h200_fp8())
+            .expect("defaults must run on H200 fp8");
     }
 }

@@ -154,13 +154,16 @@ impl CapacityModel {
             },
             Remedy {
                 knob: "MOE_BACKEND",
-                setting: "DEEPGEMM",
-                multiplier: 19.8 / 17.0,
-                evidence: Evidence::Transferred,
-                because: "AUTO resolves to CUTLASS on SM90. deep_gemm plus \
-                          expert parallelism off took a neighbouring stack from \
-                          goodput 17.0 to 19.8 on this model and hardware -- it \
-                          was listed here as untested until that run existed",
+                setting: "CUTLASS",
+                multiplier: 1.0,
+                evidence: Evidence::Untested,
+                because: "AUTO already resolves to CUTLASS on SM90, so this \
+                          only makes the choice explicit. DEEPGEMM and TRTLLM \
+                          both refuse anything but SM100/103 and MARLIN needs \
+                          an NVFP4 checkpoint, so on H200 with fp8 there is no \
+                          other MoE backend to try -- the neighbouring stack's \
+                          17.0-to-19.8 with deep_gemm was vLLM's own \
+                          implementation, not this flag",
                 with: "",
             },
             Remedy {
