@@ -106,7 +106,7 @@ set -uo pipefail
 #
 # If it fails, N=64 is the derived fallback: same configuration, +39% and +19%
 # margin, goodput 9.17 req/s.
-: "${N:=80}"
+: "${N:=128}"
 # The official AIPerf shape. Reported by the startup KV-pool check for context;
 # the check itself sizes against MAX_SEQ_LEN, because GUARANTEED_NO_EVICT
 # reserves that per admitted request rather than what the request will use.
@@ -138,8 +138,8 @@ set -uo pipefail
 # changes is the activation workspace, which is what made 0.70 OOM at two GPUs
 # per worker. PP2 x DP2 was the requested way to probe that and did not survive
 # NCCL init; see the PREFILL_PP note above.
-: "${PREFILL_WORKERS:=2}"
-: "${PREFILL_TP:=4}"
+: "${PREFILL_WORKERS:=4}"
+: "${PREFILL_TP:=2}"
 # PP2 x attention-DP over the same four GPUs was tried (316457) and never got as
 # far as allocating memory: NCCL communicator probe initialization timed out
 # after 60 s on all four ranks, in both workers, while the TP8 decode worker on
@@ -355,6 +355,54 @@ set -uo pipefail
 # on the first requests, so a win has to be big enough to pay that back.
 : "${TORCH_COMPILE:=0}"
 
+# ---------------------------------------------------------------------------
+# WHAT A NEIGHBOURING STACK MEASURED AT GOODPUT 22.419 ON THIS HARDWARE.
+#
+# Our own best valid cold-cache number is 14.35. The gap is these four, and
+# each is here with the evidence that put it here rather than as a guess.
+
+# fp8_e4m3 KV, both sides. This is what reopened TP2 prefill: our own TP2 died
+# at KV fractions 0.30, 0.50 and 0.70, and every one of those ran KV in fp16.
+# 220.2 GiB of weights over TP2 leaves 20.9 GiB per rank, which holds prefill's
+# in-flight KV comfortably in fp8 and not in fp16. The topology was never what
+# was wrong. KvCacheConfig.dtype: 'auto' inherits the checkpoint's own
+# quantisation metadata, 'fp8' overrides it.
+: "${KV_CACHE_DTYPE:=fp8}"
+
+# Prefix caching OFF, and this one is about validity rather than speed.
+# enable_block_reuse defaults to TRUE. A teammate's 17.67 was withdrawn on
+# audit for exactly this: cached-token 93,632,679 against new-token 824,424, a
+# 99.1% hit rate, prefill doing 1% of the work the benchmark meant to measure.
+# AIPerf's --cache-bust first_turn_prefix should defeat it, but "should" is not
+# a measurement and a headline number that does not survive an audit is worth
+# less than no number.
+: "${BLOCK_REUSE:=false}"
+
+# Prefill's in-flight token budget. Upstream defaults to 8192; the 22.419
+# configuration runs 16384, four whole ISL-4000 prompts in one iteration. This
+# is also the quantity our own two models disagree about: `plan` calibrated on
+# large batches and `sim` assumes 1.118 sequences per prefill batch, which is
+# most of the 14.30-versus-7.53 gap.
+: "${PREFILL_MAX_NUM_TOKENS:=16384}"
+
+# EAGLE3 speculative decoding, decode side only.
+#
+# The neighbouring stack measured, on this model and this hardware: acceptance
+# alpha 1.82 (median, n=33), 12/12 outputs token-identical under greedy
+# sampling, and ITL p95 11.08 ms against 19.18 baseline at topk=1. topk=2 gave
+# 14.97 ms and cost 5% of goodput; topk=4 collapsed to 3.29 at a 25.1% pass
+# rate. One draft token is not a timid setting, it is the only measured win.
+#
+# The draft checkpoint is LlamaForCausalLMEagle3 with aux hidden states from
+# layers 1/46/90, which is the architecture TRT-LLM's Eagle3DecodingConfig
+# expects (eagle3_model_arch defaults to 'llama3').
+#
+# Default OFF: this is transferred evidence from a different serving stack, and
+# whether TRT-LLM's Eagle3 path reproduces the ratio is what a run settles.
+: "${SPEC_DECODE:=0}"
+: "${SPEC_MODEL:=/work/u4063814/hf_cache/eagle3/qwen3-235b-instruct-2507-specforge}"
+: "${SPEC_DRAFT_TOKENS:=1}"
+
 # Off upstream, and left off deliberately. Chunked prefill exists to interleave
 # a long prompt with decode work in the same iteration, and a disaggregated
 # prefill worker has no decode work to interleave with. At ISL 4000 against
@@ -439,6 +487,22 @@ write_engine_yaml () {
     if [ "${HOST_DISPATCH_SPIN}" = 1 ]; then
       echo "enable_low_latency_host_dispatch: true"
     fi
+    # KV cache: dtype and block reuse. Both sides.
+    echo "kv_cache_config:"
+    echo "  dtype: ${KV_CACHE_DTYPE}"
+    echo "  enable_block_reuse: ${BLOCK_REUSE}"
+    if [ "$role" = prefill ]; then
+      # Prefill's in-flight budget. Decode leaves max_num_tokens alone: its
+      # iterations carry one token per sequence, not whole prompts.
+      echo "max_num_tokens: ${PREFILL_MAX_NUM_TOKENS}"
+    elif [ "${SPEC_DECODE}" != 0 ]; then
+      echo "speculative_config:"
+      echo "  decoding_type: Eagle3"
+      echo "  speculative_model: ${SPEC_MODEL}"
+      echo "  max_draft_len: ${SPEC_DRAFT_TOKENS}"
+      echo "  eagle3_one_model: true"
+      echo "  greedy_sampling: true"
+    fi
     case "${TORCH_COMPILE}" in
       0) ;;
       inductor)
@@ -466,7 +530,15 @@ write_engine_yaml () {
       # max_batch_size defaults to 0 and enable_padding to False, so enabling
       # capture without setting them captures nothing, and without padding a
       # varying decode batch misses what little it did capture.
-      echo "  max_batch_size: ${CUDA_GRAPH_MAX_BATCH}"
+      # Speculation multiplies the batch dimension: a step for `cap`
+      # sequences runs cap x (1 + draft) rows. A capture sized for cap alone
+      # silently misses every speculative step -- the same class of failure as
+      # max_batch_size 0, which is configured, enabled, and does nothing.
+      graph_cap="${CUDA_GRAPH_MAX_BATCH}"
+      if [ "$role" = decode ] && [ "${SPEC_DECODE}" != 0 ]; then
+        graph_cap=$(( CUDA_GRAPH_MAX_BATCH * (1 + SPEC_DRAFT_TOKENS) ))
+      fi
+      echo "  max_batch_size: ${graph_cap}"
       echo "  enable_padding: true"
     fi
     echo "cache_transceiver_config:"

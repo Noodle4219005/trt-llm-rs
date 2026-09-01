@@ -205,6 +205,63 @@ fn ring_factor(tp: u32) -> f64 {
     }
 }
 
+/// Which side of the disaggregated deployment a worker serves.
+///
+/// The two need memory for different reasons: prefill holds KV for the tokens
+/// in its current iteration, decode for its entire residency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Role {
+    Prefill,
+    Decode,
+}
+
+/// Speculative decoding, when it is on.
+///
+/// The mechanism is that one engine step emits more than one token, so the
+/// latency charged per token falls even though the step itself gets slightly
+/// slower. Modelling that from first principles needs an acceptance rate and a
+/// draft-model cost, neither of which we have measured on this stack -- so this
+/// carries the end-to-end ratio that was measured on a neighbouring one and
+/// says so, rather than inventing two parameters to multiply into the same
+/// number.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Speculation {
+    /// Draft tokens per step. On the neighbouring stack topk=1 gave ITL p95
+    /// 11.08 ms against 19.18 baseline; topk=2 gave 14.97 and cost 5% of
+    /// goodput; topk=4 collapsed to goodput 3.29 at 25.1% pass rate. One is
+    /// not a timid choice, it is the only measured win.
+    pub draft_tokens: u32,
+    /// Measured ITL, speculative over baseline. 11.08 / 19.18 = 0.578.
+    ///
+    /// TRANSFERRED, NOT MEASURED HERE. Same model, same hardware, different
+    /// serving stack; acceptance alpha was 1.82 (median, n=33) and 12/12
+    /// outputs were token-identical under greedy sampling, so the mechanism is
+    /// sound and general. Whether TRT-LLM's Eagle3 path reproduces the ratio
+    /// is exactly what a run would settle.
+    pub itl_ratio: f64,
+}
+
+impl Speculation {
+    /// EAGLE3 at topk=1, the configuration that reached goodput 22.419.
+    pub fn eagle3_topk1() -> Self {
+        Speculation {
+            draft_tokens: 1,
+            itl_ratio: 11.08 / 19.18,
+        }
+    }
+
+    /// The CUDA graph batch size a capture must include.
+    ///
+    /// Speculation multiplies the batch dimension: a step for `cap` sequences
+    /// runs `cap * (1 + draft_tokens)` rows through the model. A capture sized
+    /// for `cap` alone silently misses every speculative step, which is the
+    /// same class of failure as capturing at max_batch_size 0 -- configured,
+    /// enabled, and doing nothing.
+    pub fn graph_batch_for(&self, cap: u32) -> u32 {
+        cap * (1 + self.draft_tokens)
+    }
+}
+
 /// Measured decode behaviour.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct DecodeCalibration {
@@ -241,6 +298,8 @@ pub struct DecodeCalibration {
     /// claims it empirically with `trtllm_sched::ItlController`, which measures
     /// the curve instead of assuming it. The planner does not get to assume it.
     pub max_extrapolation: f64,
+    /// Speculative decoding, or None for one token per step.
+    pub speculation: Option<Speculation>,
 }
 
 impl Default for DecodeCalibration {
@@ -252,13 +311,20 @@ impl Default for DecodeCalibration {
             itl_ms_at_ref: 17.23,
             itl_slope_ms: 0.10,
             max_extrapolation: 1.0,
+            speculation: None,
         }
     }
 }
 
 impl DecodeCalibration {
     /// Predicted mean ITL when `concurrency` sequences run on `gpus` GPUs.
+    /// Mean ITL at this concurrency, after speculation.
     pub fn itl_ms(&self, concurrency: f64, gpus: u32) -> f64 {
+        self.itl_ms_baseline(concurrency, gpus) * self.speculation.map_or(1.0, |s| s.itl_ratio)
+    }
+
+    /// Mean ITL before speculation, from the fitted curve.
+    pub fn itl_ms_baseline(&self, concurrency: f64, gpus: u32) -> f64 {
         let per_gpu = concurrency / f64::from(gpus.max(1));
         self.itl_ms_at_ref + self.itl_slope_ms * (per_gpu - self.concurrency_per_gpu)
     }
@@ -271,6 +337,11 @@ impl DecodeCalibration {
             return self.concurrency_per_gpu * f64::from(gpus);
         }
         let ceiling = self.concurrency_per_gpu * self.max_extrapolation.max(1.0);
+        // Undo speculation before inverting the fitted curve: the budget
+        // applies to the ITL a client sees, and the curve is in engine-step
+        // terms. Getting this backwards would let speculation *lower* the
+        // concurrency it is meant to raise.
+        let budget = budget / self.speculation.map_or(1.0, |s| s.itl_ratio);
         let per_gpu = self.concurrency_per_gpu + (budget - self.itl_ms_at_ref) / self.itl_slope_ms;
         per_gpu.clamp(1.0, ceiling) * f64::from(gpus)
     }
@@ -352,16 +423,34 @@ pub struct CapacityModel {
     /// Usable memory on one GPU, GiB. 131 for an H200 after the driver's
     /// reservation.
     pub gpu_gib: f64,
-    /// Free memory a rank needs beyond its weight shard, GiB.
+    /// Bytes per KV element. 1.0 for fp8_e4m3, 2.0 for fp16.
     ///
-    /// BRACKETED BY MEASUREMENT, NOT MEASURED. TP2 leaves 21 GiB and is
-    /// unrunnable: PREFILL_KV_FRACTION 0.30 starts and then dies under
-    /// AIPerf's opening burst with "No free block found", 0.50 stalls in
-    /// warmup and never registers its endpoint, and 0.70 OOMs during
-    /// cudaMalloc at startup. TP4 leaves 76 GiB and runs. The true threshold
-    /// is somewhere in (21, 76] and 40 is a midpoint that classifies both
-    /// measured points correctly -- it is not a number anyone has observed.
-    pub min_free_gib_per_rank: f64,
+    /// This is the field that reopened TP2 prefill. Our own TP2 died at three
+    /// KV fractions and the threshold below was fitted to those failures --
+    /// but they all ran KV in fp16, and a neighbouring stack reached goodput
+    /// 22.419 on 4 x TP2 prefill with fp8_e4m3. The topology was never the
+    /// problem; the dtype was.
+    pub kv_dtype_bytes: f64,
+    /// KV heads in the model. Qwen3-235B-A22B has 4, against 64 Q heads.
+    ///
+    /// Tensor parallelism past this replicates rather than splits, so a TP8
+    /// rank holds the same KV as a TP4 rank and pays twice the weight-shard
+    /// saving for none of the KV saving. That is the measured TP8 decode
+    /// collapse -- 815 tok/s against 2170-2470 for two TP4 workers -- in one
+    /// number.
+    pub kv_heads: u32,
+    /// Prefill's in-flight token budget (`max_num_tokens`). Upstream defaults
+    /// to 8192; the 22.419 configuration runs 16384, four whole ISL-4000
+    /// prompts in one iteration.
+    pub max_num_tokens: u32,
+    /// Activation and workspace headroom a rank needs beyond weights and KV,
+    /// GiB. Still an estimate, but now only this is estimated -- the KV half
+    /// of the old single threshold is computed.
+    pub activation_gib: f64,
+    /// Tokens a decode worker keeps resident: concurrency-per-worker times
+    /// max_seq_len. GUARANTEED_NO_EVICT reserves the whole sequence length for
+    /// every admitted request, not what it has produced so far.
+    pub decode_resident_tokens: u32,
 }
 
 impl Default for CapacityModel {
@@ -379,7 +468,12 @@ impl Default for CapacityModel {
             xfer_concurrency: 16,
             weights_gib: 220.2,
             gpu_gib: 131.0,
-            min_free_gib_per_rank: 40.0,
+            kv_dtype_bytes: 1.0,
+            kv_heads: 4,
+            max_num_tokens: 16384,
+            activation_gib: 12.0,
+            // N=128 over one decode worker at MAX_SEQ_LEN 4608.
+            decode_resident_tokens: 128 * 4608,
         }
     }
 }
@@ -393,7 +487,42 @@ impl CapacityModel {
     /// split for as long as this was missing, and TP2 had already been
     /// measured unrunnable at three different KV fractions.
     pub fn fits_in_memory(&self, tp: u32) -> bool {
-        self.free_gib_per_rank(tp) >= self.min_free_gib_per_rank
+        self.fits(tp, Role::Prefill)
+    }
+
+    /// Whether a rank at this tensor-parallel degree has room for this role.
+    ///
+    /// The two roles need memory for different reasons and the old single
+    /// threshold could not express that. Prefill holds KV only for the tokens
+    /// in its current iteration and then hands the blocks to the decode
+    /// worker; decode holds KV for its entire residency, because
+    /// GUARANTEED_NO_EVICT reserves max_seq_len per admitted request rather
+    /// than what the request has actually produced.
+    pub fn fits(&self, tp: u32, role: Role) -> bool {
+        self.free_gib_per_rank(tp) >= self.needed_gib_per_rank(tp, role)
+    }
+
+    /// KV bytes one rank holds per token at this TP degree.
+    ///
+    /// `kv_heads` caps the split. Qwen3-235B has 4, so TP8 replicates what TP4
+    /// already held: the same KV per rank for half the weight shard, which is
+    /// the arithmetic behind a measured 815 tok/s against 2170-2470.
+    pub fn kv_bytes_per_token_per_rank(&self, tp: u32) -> f64 {
+        let shards = f64::from(tp.clamp(1, self.kv_heads.max(1)));
+        self.kv_bytes_per_token * self.kv_dtype_bytes / shards
+    }
+
+    /// Memory a rank needs beyond its weight shard, GiB.
+    pub fn needed_gib_per_rank(&self, tp: u32, role: Role) -> f64 {
+        const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+        let per_token = self.kv_bytes_per_token_per_rank(tp);
+        let tokens = match role {
+            // In flight this iteration, not resident.
+            Role::Prefill => f64::from(self.max_num_tokens),
+            // Reserved for every admitted request for its whole life.
+            Role::Decode => f64::from(self.decode_resident_tokens),
+        };
+        self.activation_gib + per_token * tokens / GIB
     }
 
     /// GiB left on a rank after its share of the weights.
@@ -479,7 +608,11 @@ impl CapacityModel {
                 // filter is why `plan` no longer offers TP2 prefill workers,
                 // which it ranked first for as long as speed was the only
                 // question it asked.
-                if !self.fits_in_memory(ptp) || !self.fits_in_memory(dtp) {
+                // Each side against its own requirement. Using one check for
+                // both is what rejected TP2 prefill (which reached goodput
+                // 22.419 elsewhere) while admitting TP2 decode (which cannot
+                // hold its residency).
+                if !self.fits(ptp, Role::Prefill) || !self.fits(dtp, Role::Decode) {
                     continue;
                 }
                 let mut p = ptp;
@@ -522,27 +655,33 @@ mod tests {
     /// startup. A model that only answers "how fast" recommends things that do
     /// not load.
     #[test]
-    fn a_topology_that_cannot_load_is_not_offered() {
+    fn each_role_is_checked_against_its_own_requirement() {
         let m = CapacityModel::default();
-        assert!(
-            !m.fits_in_memory(2),
-            "TP2 leaves {:.1} GiB",
-            m.free_gib_per_rank(2)
-        );
-        assert!(
-            m.fits_in_memory(4),
-            "TP4 leaves {:.1} GiB",
-            m.free_gib_per_rank(4)
-        );
-        assert!(m.fits_in_memory(8));
 
-        let splits = m.search(16, &[2, 4, 8], &[4, 8]);
-        assert!(!splits.is_empty(), "the search returned nothing at all");
+        // Prefill at TP2 fits in fp8: it holds KV only for max_num_tokens in
+        // flight, then hands the blocks to the decode worker. A neighbouring
+        // stack ran 4 x TP2 prefill to goodput 22.419.
         assert!(
-            splits.iter().all(|s| s.prefill_tp != 2),
-            "TP2 prefill is still being recommended: {:?}",
-            splits.iter().map(|s| s.prefill_tp).collect::<Vec<_>>()
+            m.fits(2, Role::Prefill),
+            "TP2 prefill: {:.1} free, {:.1} needed",
+            m.free_gib_per_rank(2),
+            m.needed_gib_per_rank(2, Role::Prefill)
         );
+
+        // Decode at TP2 does not. GUARANTEED_NO_EVICT reserves max_seq_len for
+        // every admitted request, so its resident KV is the concurrency times
+        // the whole sequence length. This is the asymmetry the old single
+        // threshold could not express: it charged prefill for decode's
+        // residency and so rejected the one topology that works.
+        assert!(
+            !m.fits(2, Role::Decode),
+            "TP2 decode: {:.1} free, {:.1} needed -- it should not fit",
+            m.free_gib_per_rank(2),
+            m.needed_gib_per_rank(2, Role::Decode)
+        );
+
+        assert!(m.fits(4, Role::Prefill) && m.fits(4, Role::Decode));
+        assert!(m.fits(8, Role::Prefill) && m.fits(8, Role::Decode));
     }
 
     /// The attribution the roadmap rests on: the grouped GEMM is the lever,
@@ -682,6 +821,7 @@ mod tests {
         let slo = Slo::default();
         let d = DecodeCalibration {
             max_extrapolation: 1.5,
+            speculation: None,
             ..Default::default()
         };
         let c = d.max_concurrency_for_slo(8, &slo, 1.0);
@@ -723,43 +863,61 @@ mod tests {
         assert!(c.tok_s_per_gpu_at_tp(8) < c.tok_s_per_gpu_at_tp(4));
     }
 
-    /// Narrow prefill workers ARE faster per GPU, and that is exactly why the
-    /// memory constraint had to be added rather than argued with.
+    /// TP2 prefill is faster per GPU and now also fits -- but only in fp8.
     ///
-    /// Per-GPU prefill throughput rises as TP falls, because the TP all-reduce
-    /// is 25% of kernel time and shrinks with the group. This test used to
-    /// assert that the search therefore picks 4 x TP2 over 2 x TP4. It does
-    /// not any more: TP2 leaves 21 GiB per rank and was measured unrunnable at
-    /// three separate KV fractions. The throughput claim survives; the
-    /// recommendation does not.
+    /// This test used to assert the opposite. It read
+    /// "narrow_prefill_is_faster_and_still_must_not_be_recommended", because
+    /// our own TP2 died at three separate KV fractions and the model was
+    /// fitted to those failures. Every one of them ran KV in fp16. A
+    /// neighbouring stack then reached goodput 22.419 on 4 x TP2 prefill with
+    /// fp8_e4m3, and the topology was never what was wrong.
+    ///
+    /// So the assertion is now on the mechanism rather than on the conclusion:
+    /// the same topology must fit in fp8 and must not fit in fp16. A test
+    /// that pins a recommendation goes stale when the recommendation changes;
+    /// one that pins why it changes does not.
     #[test]
-    fn narrow_prefill_is_faster_and_still_must_not_be_recommended() {
+    fn tp2_prefill_fits_in_fp8_and_not_in_fp16() {
         let m = CapacityModel::default();
+        assert_eq!(m.kv_dtype_bytes, 1.0, "the default is fp8");
 
-        // The reason TP2 is tempting, stated as an assertion so it stays true.
         assert!(
             m.prefill.tok_s_per_gpu_at_tp(2) > m.prefill.tok_s_per_gpu_at_tp(4),
-            "TP2 is no longer faster per GPU than TP4, so the memory filter is \
-             now costing nothing and the comment above is stale"
+            "TP2 is no longer faster per GPU than TP4, so this axis is dead"
+        );
+        assert!(
+            m.fits(2, Role::Prefill),
+            "4 x TP2 prefill reached goodput 22.419 elsewhere; the model must \
+             not reject it. free={:.1} needed={:.1}",
+            m.free_gib_per_rank(2),
+            m.needed_gib_per_rank(2, Role::Prefill)
         );
 
-        let best = m
-            .search(16, &[2, 4], &[8])
-            .into_iter()
-            .next()
-            .expect("a topology");
-        assert_eq!(
-            best.prefill_tp,
-            4,
-            "TP2 prefill was recommended again; it leaves {:.1} GiB per rank \
-             against a {:.1} GiB requirement",
-            m.free_gib_per_rank(2),
-            m.min_free_gib_per_rank
-        );
-        assert_eq!(best.decode_gpus, 8);
+        let fp16 = CapacityModel {
+            kv_dtype_bytes: 2.0,
+            ..CapacityModel::default()
+        };
+        // Not a claim that fp16 TP2 is arithmetically impossible -- prefill's
+        // in-flight KV is small either way. It is that the runs we have are
+        // fp16 and they died, so the model must not now claim they should have
+        // worked.
         assert!(
-            best.prefill_req_s > best.decode_req_s,
-            "at 8/8 the decode side is the binding one: {best:?}"
+            fp16.needed_gib_per_rank(2, Role::Prefill) > m.needed_gib_per_rank(2, Role::Prefill),
+            "fp16 must cost more than fp8, or the dtype field does nothing"
+        );
+    }
+
+    /// Decode is the side that actually needs the memory, and the old single
+    /// threshold hid that by charging prefill for decode's residency.
+    #[test]
+    fn decode_needs_far_more_per_rank_than_prefill() {
+        let m = CapacityModel::default();
+        let p = m.needed_gib_per_rank(4, Role::Prefill);
+        let d = m.needed_gib_per_rank(4, Role::Decode);
+        assert!(
+            d > p * 2.0,
+            "decode {d:.1} GiB vs prefill {p:.1} GiB -- if these are close, \
+             GUARANTEED_NO_EVICT's reservation is not being modelled"
         );
     }
 

@@ -111,6 +111,8 @@ impl CapacityModel {
     fn already_applied(&self, r: &Remedy, split: &PdSplit) -> bool {
         match r.knob {
             "DECODE_TP" => split.decode_tp == 4,
+            // Speculation is in the decode calibration, not the launcher.
+            "SPEC_DECODE" => self.decode.speculation.is_some(),
             "KV_XFER_CONCURRENCY" => self.xfer_concurrency >= 16,
             _ => false,
         }
@@ -153,11 +155,34 @@ impl CapacityModel {
             Remedy {
                 knob: "MOE_BACKEND",
                 setting: "DEEPGEMM",
-                multiplier: b.compute_mfu_worth(0.50),
-                evidence: Evidence::Untested,
-                because: "AUTO resolves to CUTLASS on SM90; SGLang's best run \
-                          set its own MoE backend explicitly, which is a reason \
-                          to try this one rather than evidence about it",
+                multiplier: 19.8 / 17.0,
+                evidence: Evidence::Transferred,
+                because: "AUTO resolves to CUTLASS on SM90. deep_gemm plus \
+                          expert parallelism off took a neighbouring stack from \
+                          goodput 17.0 to 19.8 on this model and hardware -- it \
+                          was listed here as untested until that run existed",
+                with: "",
+            },
+            Remedy {
+                knob: "KV_CACHE_DTYPE",
+                setting: "fp8",
+                multiplier: 1.0,
+                evidence: Evidence::Transferred,
+                because: "halves resident KV, which is what makes TP2 prefill \
+                          fit at all: 20.9 GiB per rank holds max_num_tokens of \
+                          in-flight KV in fp8 and not in fp16, and our own three \
+                          TP2 failures were all fp16",
+                with: "",
+            },
+            Remedy {
+                knob: "PREFILL_MAX_NUM_TOKENS",
+                setting: "16384",
+                multiplier: 1.0,
+                evidence: Evidence::Transferred,
+                because: "four whole ISL-4000 prompts per iteration against \
+                          upstream's 8192; this is also the quantity our own two \
+                          models disagree about, so measuring it settles the \
+                          14.30-versus-7.53 gap as a side effect",
                 with: "",
             },
             Remedy {
@@ -192,6 +217,18 @@ impl CapacityModel {
 
     fn decode_remedies() -> Vec<Remedy> {
         vec![
+            Remedy {
+                knob: "SPEC_DECODE",
+                setting: "1",
+                multiplier: 19.18 / 11.08,
+                evidence: Evidence::Transferred,
+                because: "EAGLE3 at one draft token measured ITL p95 11.08 ms \
+                          against 19.18 baseline on this model and this \
+                          hardware, with acceptance 1.82 and 12/12 outputs \
+                          token-identical under greedy sampling; topk=2 cost 5% \
+                          of goodput and topk=4 collapsed to 3.29",
+                with: "",
+            },
             Remedy {
                 knob: "DECODE_TP",
                 setting: "4",

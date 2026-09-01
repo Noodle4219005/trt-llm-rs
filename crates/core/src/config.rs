@@ -55,7 +55,16 @@ impl Config {
             xfer_concurrency: self.kv.xfer_concurrency,
             weights_gib: self.model.weights_gib,
             gpu_gib: self.topology.gpu_gib,
-            min_free_gib_per_rank: self.topology.min_free_gib_per_rank,
+            kv_dtype_bytes: self.topology.kv_dtype_bytes,
+            kv_heads: self.model.num_kv_heads,
+            max_num_tokens: self.workload.max_num_tokens,
+            activation_gib: self.topology.activation_gib,
+            // GUARANTEED_NO_EVICT reserves max_seq_len for every admitted
+            // request, so a decode worker's resident KV is its share of the
+            // concurrency times the whole sequence length -- not what the
+            // requests have actually produced.
+            decode_resident_tokens: self.workload.concurrency / self.topology.decode_workers.max(1)
+                * self.workload.max_seq_len,
         }
     }
 
@@ -125,6 +134,11 @@ pub struct WorkloadConfig {
     pub osl: u32,
     /// Closed-loop client concurrency.
     pub concurrency: u32,
+    /// Prefill's in-flight token budget (`max_num_tokens`). Upstream defaults
+    /// to 8192; the 22.419 configuration runs 16384, four whole prompts.
+    pub max_num_tokens: u32,
+    /// Per-request reservation under GUARANTEED_NO_EVICT.
+    pub max_seq_len: u32,
     pub warmup_s: f64,
     pub benchmark_s: f64,
     /// Extra time after the benchmark window in which requests issued inside
@@ -141,7 +155,10 @@ impl Default for WorkloadConfig {
         Self {
             isl: 4000,
             osl: 200,
-            concurrency: 80,
+            // 128, matching the 22.419 configuration. It was 80.
+            concurrency: 128,
+            max_num_tokens: 16384,
+            max_seq_len: 4608,
             warmup_s: 60.0,
             benchmark_s: 120.0,
             grace_s: 30.0,
@@ -161,10 +178,12 @@ pub struct TopologyConfig {
     pub decode_tp: u32,
     /// Usable GiB on one GPU after the driver's reservation. 131 on H200.
     pub gpu_gib: f64,
-    /// GiB a rank needs beyond its weight shard. See
-    /// `CapacityModel::min_free_gib_per_rank` -- bracketed by measurement at
-    /// TP2 (21 GiB, unrunnable) and TP4 (76 GiB, runs), not observed directly.
-    pub min_free_gib_per_rank: f64,
+    /// Bytes per KV element: 1.0 for fp8_e4m3, 2.0 for fp16. Our own TP2
+    /// prefill died at three KV fractions in fp16; a neighbouring stack
+    /// reached goodput 22.419 on 4 x TP2 with fp8_e4m3.
+    pub kv_dtype_bytes: f64,
+    /// Activation and workspace headroom beyond weights and KV, GiB.
+    pub activation_gib: f64,
 }
 
 impl Default for TopologyConfig {
@@ -174,16 +193,22 @@ impl Default for TopologyConfig {
     fn default() -> Self {
         Self {
             total_gpus: 16,
-            prefill_workers: 2,
-            // 2P2D on TP4, the shape this deployment runs. It was 4P1D on
-            // TP2 until TP2 was measured unrunnable -- 110.1 GiB of weights on
-            // a 131 GiB card leaves 21 GiB, which cannot hold the activation
-            // workspace, the CUDA graphs and a KV pool at once.
-            prefill_tp: 4,
+            // 4 x TP2. This was 2 x TP4 for as long as the memory model
+            // charged prefill for decode's residency and so rejected TP2;
+            // a neighbouring stack reached goodput 22.419 on 4 x TP2 prefill
+            // with fp8 KV, and the corrected model now picks the same shape.
+            prefill_workers: 4,
+            // 20.9 GiB per rank after the weight shard. That holds
+            // max_num_tokens of in-flight KV in fp8 and not in fp16, which is
+            // why our own three TP2 attempts died and the fp8 one elsewhere
+            // did not. Prefill hands its blocks to the decode worker; it is
+            // decode that needs a residency, and decode still runs TP4.
+            prefill_tp: 2,
             decode_workers: 2,
             decode_tp: 4,
             gpu_gib: 131.0,
-            min_free_gib_per_rank: 40.0,
+            kv_dtype_bytes: 1.0,
+            activation_gib: 12.0,
         }
     }
 }
@@ -331,25 +356,34 @@ impl Default for CalibrationConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capacity::Role;
 
-    /// The default describes the deployment that runs, and every part of it has
-    /// been measured. It was 4P1D on TP2 prefill with a TP8 decode worker until
-    /// both halves of that were refuted: TP2 leaves 21 GiB per rank and is
-    /// unrunnable at any KV fraction, and one TP8 decode worker delivered
-    /// 815 tok/s where two TP4 workers reach 2,170-2,470 -- Qwen3-235B has four
-    /// KV heads, so TP4 gives each rank one and TP8 must duplicate.
+    /// The default describes the deployment that runs, and it has now been
+    /// wrong in both directions.
+    ///
+    /// It was 4P1D on TP2 prefill with a TP8 decode worker. Both halves were
+    /// refuted: one TP8 decode worker delivered 815 tok/s where two TP4 workers
+    /// reach 2,170-2,470 (Qwen3-235B has four KV heads, so TP4 gives each rank
+    /// one and TP8 must duplicate), and TP2 prefill died at three separate KV
+    /// fractions. So it became 2P2D on TP4.
+    ///
+    /// The TP2 half of that has now been refuted in turn. Every one of those
+    /// failures ran KV in fp16; a neighbouring stack reached goodput 22.419 on
+    /// 4 x TP2 prefill with fp8_e4m3, and the corrected memory model -- which
+    /// no longer charges prefill for decode's residency -- picks the same
+    /// shape. The decode half stands: decode still needs TP4.
     #[test]
-    fn default_config_is_valid_and_is_2p2d_on_tp4() {
+    fn default_config_is_valid_and_is_4p2d_on_narrow_prefill() {
         let c = Config::default();
         c.validate().expect("default config must validate");
-        assert_eq!(c.topology.prefill_workers, 2);
-        assert_eq!(c.topology.prefill_tp, 4);
+        assert_eq!(c.topology.prefill_workers, 4);
+        assert_eq!(c.topology.prefill_tp, 2);
         assert_eq!(c.topology.decode_workers, 2);
         assert_eq!(c.topology.decode_tp, 4);
-        // Every rank must have room for more than its weight shard.
+        // Each role against its own requirement.
         let m = c.capacity_model();
-        assert!(m.fits_in_memory(c.topology.prefill_tp));
-        assert!(m.fits_in_memory(c.topology.decode_tp));
+        assert!(m.fits(c.topology.prefill_tp, Role::Prefill));
+        assert!(m.fits(c.topology.decode_tp, Role::Decode));
         assert_eq!(
             c.topology.prefill_workers * c.topology.prefill_tp
                 + c.topology.decode_workers * c.topology.decode_tp,

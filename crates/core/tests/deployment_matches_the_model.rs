@@ -12,6 +12,7 @@
 use std::fs;
 use std::path::PathBuf;
 
+use trtllm_core::capacity::Role;
 use trtllm_core::config::Config;
 
 fn launcher() -> String {
@@ -91,14 +92,23 @@ fn the_deployment_the_launcher_runs_is_one_the_model_would_recommend() {
 
     let ptp = number(&s, "PREFILL_TP") as u32;
     let dtp = number(&s, "DECODE_TP") as u32;
+    // Each role against its own requirement. They differ by more than 2x,
+    // and charging prefill for decode's residency is what made the model
+    // reject the TP2 prefill that reached goodput 22.419 elsewhere.
     assert!(
-        m.fits_in_memory(ptp),
-        "the launcher runs TP{ptp} prefill workers, which leave {:.1} GiB per \
-         rank against a {:.1} GiB requirement",
+        m.fits(ptp, Role::Prefill),
+        "the launcher runs TP{ptp} prefill workers: {:.1} GiB free per rank \
+         against {:.1} GiB needed",
         m.free_gib_per_rank(ptp),
-        m.min_free_gib_per_rank
+        m.needed_gib_per_rank(ptp, Role::Prefill)
     );
-    assert!(m.fits_in_memory(dtp), "TP{dtp} decode does not fit");
+    assert!(
+        m.fits(dtp, Role::Decode),
+        "the launcher runs TP{dtp} decode workers: {:.1} GiB free per rank \
+         against {:.1} GiB needed",
+        m.free_gib_per_rank(dtp),
+        m.needed_gib_per_rank(dtp, Role::Decode)
+    );
 
     // And it should be on the shortlist, not merely feasible.
     let best = m
