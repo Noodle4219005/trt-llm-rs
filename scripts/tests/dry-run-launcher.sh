@@ -41,6 +41,37 @@ export SLURM_SUBMIT_DIR="$PWD"
 STOP='########## NCCL preflight ##########'
 sed "/$STOP/,\$d" "$SCRIPT" > "$WORK/head.sh"
 
+# The half this cannot execute still gets checked, because the half it could
+# execute is not where the last two defects were. Forty-nine lines of dead
+# heredoc sat after the engine-config writer; a verdict block landed inside
+# `cleanup ()` and produced `echo "echo; echo "########## verdict ##########"`,
+# which bash accepts -- the quotes close and `##########` starts a comment --
+# and which the cut above never reached. Both were syntactically valid garbage
+# in a region the runner did not enter.
+echo "=== static checks over the whole script ==="
+static_fail=0
+
+# An `echo` line with an odd number of double quotes. That is the exact
+# signature of the cleanup-block bug -- `echo "echo; echo "###...` has three --
+# and it is narrow enough not to fire on a multi-line `python3 -c "` string,
+# whose opening and closing lines legitimately carry one each.
+awk 'BEGIN{bad=0}
+     /^[[:space:]]*#/ {next}
+     /^[[:space:]]*echo([[:space:]]|;)/ {
+       n=gsub(/"/,"&");
+       if (n%2==1) { print "    line " NR ": echo with " n " quotes: " $0; bad=1 }
+     }
+     END{exit bad}' "$SCRIPT" || static_fail=1
+
+# A bare `key: value` at the start of a line outside a heredoc is the dead-YAML
+# signature. Anything indented, commented, or a shell label is fine.
+grep -nE '^[a-z_]+:[[:space:]]+[^ ]' "$SCRIPT" \
+  | grep -vE '^[0-9]+:[[:space:]]*#' \
+  | while read -r hit; do echo "    dead YAML? $hit"; done \
+  | grep -q . && static_fail=1
+
+if [ $static_fail = 0 ]; then echo "  static checks clean"; else echo "!!! static checks found problems"; fi
+
 echo "=== running the launcher head with the cluster stubbed ==="
 bash "$WORK/head.sh" > "$WORK/out.log" 2> "$WORK/err.log"
 rc=$?
@@ -58,5 +89,6 @@ for role in prefill decode; do
     grep -qE '\$\{|\$[A-Z]' "$f" && { echo "!!!   it still contains an unexpanded variable"; sed -n '1,20p' "$f" | grep -n '\$' | sed 's/^/      /'; fail=1; }
   fi
 done
+[ "$static_fail" = 1 ] && fail=1
 [ $fail = 0 ] && echo "=== dry run clean (exit $rc) ===" || echo "=== dry run FOUND PROBLEMS ==="
 exit $fail

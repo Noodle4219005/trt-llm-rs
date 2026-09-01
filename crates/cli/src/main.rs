@@ -51,6 +51,11 @@ enum Command {
         decode_tp: Vec<u32>,
         #[arg(long, default_value_t = 12)]
         top: usize,
+        /// Goodput to work backwards from: what each side would have to do,
+        /// and whether the MFU that implies is inside the envelope the
+        /// decomposition says exists.
+        #[arg(long)]
+        target: Option<f64>,
     },
     /// Run the deployment in simulation and print the scored result.
     /// Compare a finished run's AIPerf export with what the model predicted
@@ -160,7 +165,8 @@ fn main() -> Result<()> {
             prefill_tp,
             decode_tp,
             top,
-        } => cmd_plan(&cfg, total_gpus, &prefill_tp, &decode_tp, top),
+            target,
+        } => cmd_plan(&cfg, total_gpus, &prefill_tp, &decode_tp, top, target),
         Command::Verdict {
             aiperf,
             expect,
@@ -280,7 +286,14 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn cmd_plan(cfg: &Config, total_gpus: u32, prefill_tp: &[u32], decode_tp: &[u32], top: usize) {
+fn cmd_plan(
+    cfg: &Config,
+    total_gpus: u32,
+    prefill_tp: &[u32],
+    decode_tp: &[u32],
+    top: usize,
+    target: Option<f64>,
+) {
     let model = cfg.capacity_model();
     println!(
         "Qwen-shape capacity model  ISL {}  OSL {}  TTFT<={:.0}ms  ITL<={:.0}ms  assumed good_frac {:.2}",
@@ -397,6 +410,49 @@ fn cmd_plan(cfg: &Config, total_gpus: u32, prefill_tp: &[u32], decode_tp: &[u32]
                 "               {}",
                 r.command("scripts/stage-d-235b-disagg.sbatch")
             );
+        }
+    }
+
+    if let Some(t) = target {
+        if let Some(best) = model
+            .search(total_gpus, prefill_tp, decode_tp)
+            .into_iter()
+            .next()
+        {
+            let g = model.target_gap(&best, t);
+            let b = model.prefill.mfu_breakdown();
+            println!();
+            println!(
+                "To reach goodput {:.1} at good_frac {:.2}, the deployment must sustain {:.2} req/s:",
+                g.target_goodput, model.good_frac, g.required_req_s
+            );
+            let line = |name: &str, have: f64, factor: f64| {
+                if factor <= 1.0 {
+                    println!("  {name:<9} {have:>7.2} req/s   already there");
+                } else {
+                    println!("  {name:<9} {have:>7.2} req/s   needs {factor:.2}x");
+                }
+            };
+            line("prefill", g.prefill_req_s, g.prefill_factor);
+            line("decode", g.decode_req_s, g.decode_factor);
+            line("transfer", g.xfer_req_s, g.xfer_factor);
+            println!(
+                "  prefill MFU {:.1}% today, {:.1}% required",
+                g.mfu_now * 100.0,
+                g.mfu_required * 100.0
+            );
+            let envelope = b.duty_cycle_worth * b.allreduce_worth * b.compute_mfu_worth(0.50);
+            if g.within_the_envelope(&b) {
+                println!(
+                    "  Inside the envelope: the three levers multiply to {envelope:.2}x and {:.2}x is needed.",
+                    g.prefill_factor
+                );
+            } else {
+                println!(
+                    "  OUTSIDE the envelope: the three known levers multiply to {envelope:.2}x and {:.2}x is needed. Reaching it needs something not in this model.",
+                    g.prefill_factor
+                );
+            }
         }
     }
 

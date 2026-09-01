@@ -941,3 +941,66 @@ mod tests {
         assert!((slo.decode_req_per_s(64.0, 200) - 16.0).abs() < 1e-9);
     }
 }
+
+/// What a goodput target requires of each side.
+///
+/// The planner answers "what does this deployment do". A target asks the
+/// inverse -- "what would have to change" -- and the two are not the same
+/// question: the first is satisfied by the binding resource alone, the second
+/// has to say what binds *next* once that one moves.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct TargetGap {
+    pub target_goodput: f64,
+    /// Total request rate the target implies, given `good_frac`.
+    pub required_req_s: f64,
+    pub prefill_req_s: f64,
+    pub decode_req_s: f64,
+    pub xfer_req_s: f64,
+    /// Multiplier each side needs. 1.0 or less means that side is already
+    /// there.
+    pub prefill_factor: f64,
+    pub decode_factor: f64,
+    pub xfer_factor: f64,
+    /// Prefill MFU today, and what the target implies.
+    pub mfu_now: f64,
+    pub mfu_required: f64,
+}
+
+impl TargetGap {
+    /// Whether the MFU the target implies is inside what the decomposition
+    /// says is available at all.
+    ///
+    /// `duty_cycle_worth * allreduce_worth * compute_mfu_worth` is the product
+    /// of the three levers. A target past it needs a kernel that does not
+    /// exist yet, which is a different kind of answer from "turn these on".
+    pub fn within_the_envelope(&self, b: &MfuBreakdown) -> bool {
+        self.prefill_factor <= b.duty_cycle_worth * b.allreduce_worth * b.compute_mfu_worth(0.50)
+    }
+}
+
+impl CapacityModel {
+    /// What `target` goodput would require of a split.
+    pub fn target_gap(&self, split: &PdSplit, target: f64) -> TargetGap {
+        let required = target / self.good_frac.max(1e-9);
+        let f = |have: f64| {
+            if have > 0.0 {
+                required / have
+            } else {
+                f64::INFINITY
+            }
+        };
+        let b = self.prefill.mfu_breakdown();
+        TargetGap {
+            target_goodput: target,
+            required_req_s: required,
+            prefill_req_s: split.prefill_req_s,
+            decode_req_s: split.decode_req_s,
+            xfer_req_s: split.transfer_req_s,
+            prefill_factor: f(split.prefill_req_s),
+            decode_factor: f(split.decode_req_s),
+            xfer_factor: f(split.transfer_req_s),
+            mfu_now: b.overall,
+            mfu_required: b.overall * f(split.prefill_req_s).max(1.0),
+        }
+    }
+}
