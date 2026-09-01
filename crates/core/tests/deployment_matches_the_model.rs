@@ -124,3 +124,96 @@ fn the_deployment_the_launcher_runs_is_one_the_model_would_recommend() {
         best.decode_tp
     );
 }
+
+/// Every knob the launcher reads must come from the config.
+///
+/// This replaces a spot check. The old test compared six values by name and
+/// passed while twenty-two others drifted freely, which is the shape of a test
+/// that makes a reviewer feel covered. A user tuning the TOML would find that
+/// most of what they changed never reached the engine.
+///
+/// The launcher declares its knobs as `: "${X:=default}"`. Every one of those
+/// must appear in `Config::to_env`, and every variable `to_env` emits must be
+/// one the launcher actually reads -- an emitted variable nobody consumes is a
+/// setting a user can change with no effect, which is worse than not offering
+/// it.
+#[test]
+fn launcher_knobs_all_come_from_the_config() {
+    let script = launcher();
+    let env = Config::default().to_env();
+
+    let declared: std::collections::BTreeSet<&str> = script
+        .lines()
+        .filter_map(|l| l.strip_prefix(": \"${"))
+        .filter_map(|r| r.split(":=").next())
+        .collect();
+    let emitted: std::collections::BTreeSet<&str> = env
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| l.split('=').next())
+        .collect();
+
+    let missing: Vec<_> = declared.difference(&emitted).collect();
+    assert!(
+        missing.is_empty(),
+        "the launcher reads {:?}, which Config::to_env does not emit. A knob \
+         on one side only is a setting a user cannot reach from the file they \
+         were told to edit.",
+        missing
+    );
+
+    let unread: Vec<_> = emitted.difference(&declared).collect();
+    assert!(
+        unread.is_empty(),
+        "Config::to_env emits {:?}, which the launcher never declares. An \
+         emitted variable nobody consumes is a setting that silently does \
+         nothing.",
+        unread
+    );
+
+    assert!(
+        declared.len() >= 25,
+        "only {} knobs found -- the parser probably stopped matching the \
+         script's idiom rather than the script losing 25 settings",
+        declared.len()
+    );
+}
+
+/// The emitted file must let an explicit override win.
+///
+/// `X="${X:-value}"` keeps the layering a person expects: a variable set on the
+/// sbatch command line beats the file, which beats the built-in default. A
+/// plain `X=value` would silently reverse that and make every documented
+/// override a no-op.
+#[test]
+fn an_explicit_override_still_beats_the_emitted_file() {
+    let env = Config::default().to_env();
+    for line in env.lines().filter(|l| !l.starts_with('#') && !l.is_empty()) {
+        let (name, rest) = line.split_once('=').expect("KEY=value");
+        assert!(
+            rest.starts_with(&format!("\"${{{name}:-")),
+            "{line} does not preserve an existing value; it should read \
+             {name}=\"${{{name}:-...}}\""
+        );
+    }
+}
+
+/// The committed deployment.env must be what the config produces today.
+///
+/// It is generated, sourced by the launcher, and checked in so a reader can see
+/// the settings without running anything. All three of those are only true
+/// while it is current: a stale generated file that is still being sourced is
+/// worse than no file, because it looks authoritative.
+#[test]
+fn the_committed_deployment_env_is_current() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deployment.env");
+    let on_disk = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        panic!("{path}: {e}. Run `trt-llm-rs config --emit-env > deployment.env`")
+    });
+    assert_eq!(
+        on_disk,
+        Config::default().to_env(),
+        "deployment.env is stale. Regenerate it: \
+         `trt-llm-rs config --emit-env > deployment.env`"
+    );
+}

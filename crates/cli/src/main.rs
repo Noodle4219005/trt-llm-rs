@@ -34,7 +34,13 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Print the default configuration as TOML.
-    Config,
+    Config {
+        /// Emit the launcher's environment instead of the TOML: every variable
+        /// the deployment scripts read, derived from this config, as a
+        /// sourceable shell file.
+        #[arg(long)]
+        emit_env: bool,
+    },
     /// Enumerate prefill/decode topologies and rank them by modelled goodput.
     Plan {
         #[arg(long, default_value_t = 16)]
@@ -142,8 +148,12 @@ fn main() -> Result<()> {
     let cfg = load_config(cli.config.as_ref())?;
 
     match cli.command {
-        Command::Config => {
-            println!("{}", toml::to_string_pretty(&cfg)?);
+        Command::Config { emit_env } => {
+            if emit_env {
+                print!("{}", cfg.to_env());
+            } else {
+                println!("{}", toml::to_string_pretty(&cfg)?);
+            }
         }
         Command::Plan {
             total_gpus,

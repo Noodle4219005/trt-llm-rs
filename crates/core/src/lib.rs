@@ -11,6 +11,7 @@
 
 pub mod capacity;
 pub mod config;
+pub mod engine_config;
 pub mod error;
 pub mod ids;
 pub mod remedy;

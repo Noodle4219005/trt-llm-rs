@@ -112,6 +112,28 @@ set -uo pipefail
 # reserves that per admitted request rather than what the request will use.
 # Keep these in step with the --synthetic-input-tokens-mean and
 # --output-tokens-mean passed to aiperf below.
+# ---------------------------------------------------------------------------
+# One source of truth for every knob below.
+#
+# `trt-llm-rs config --emit-env` turns the TOML into this file, and a test
+# asserts that every `: "${X:=` in this script appears in it and vice versa --
+# so a knob cannot exist on one side only. Sourcing it here rather than
+# assigning means the layering stays what a person expects: a variable set on
+# the sbatch command line beats the file, which beats the defaults below.
+#
+# Point TRTLLM_RS_ENV at your own file to tune without editing this script.
+# Defined here rather than with the other paths below, because the knobs are
+# declared above those and this has to exist before they are sourced.
+SRC="${SRC:-/home/u5727520/trt-llm-rs}"
+DEPLOY_ENV="${TRTLLM_RS_ENV:-$SRC/deployment.env}"
+if [ -f "$DEPLOY_ENV" ]; then
+  echo "config: sourcing $DEPLOY_ENV"
+  # shellcheck disable=SC1090
+  . "$DEPLOY_ENV"
+else
+  echo "config: no $DEPLOY_ENV, using the defaults compiled into this script"
+fi
+
 : "${ISL:=4000}"
 : "${OSL:=200}"
 # Two prefill workers of four GPUs each, not four of two. Four TP2 workers is
@@ -441,7 +463,6 @@ SIF=/work/u5727520/dynamo-qwen-smoke/images/tensorrtllm-runtime-1.4.1.sif
 MODEL=/work/u4063814/hf_cache/hub/models--Qwen--Qwen3-235B-A22B-Instruct-2507-FP8/snapshots/e156cb4efae43fbee1a1ab073f946a1377e6b969
 BIND="--bind /work/u4063814,/work/u5727520,/home/u5727520,$HOME/.cargo,$HOME/.rustup"
 AIPERF=/home/u5727520/hpcai26-qwen/client-venv/bin/aiperf
-SRC=/home/u5727520/trt-llm-rs
 OUT=/work/u5727520/trt-llm-rs-runs/out/stage-d-$SLURM_JOB_ID
 TARGET=/work/u5727520/.trtllm-rs-target-container
 STAGE="$OUT/pymod"
