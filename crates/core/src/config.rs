@@ -103,7 +103,7 @@ impl Config {
         // The launcher writes this into engine.yaml verbatim, so it is a YAML
         // boolean and not the 0/1 the other flags use.
         put("BLOCK_REUSE", e.block_reuse.to_string());
-        put("SPEC_DECODE", b(e.speculation.enabled).to_string());
+        put("SPECULATION", b(e.speculation.enabled).to_string());
         put("SPEC_MODEL", e.speculation.model.clone());
         put("SPEC_DRAFT_TOKENS", e.speculation.draft_tokens.to_string());
         out

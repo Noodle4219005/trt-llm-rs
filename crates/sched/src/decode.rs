@@ -527,7 +527,7 @@ impl DecodeScheduler {
         // sequence was further behind than it is and steer against a fiction.
         //
         // ADR 0036 recorded this as a latent defect that could not be verified
-        // while the SU budget was withdrawn. Enabling SPEC_DECODE made it live.
+        // while the SU budget was withdrawn. Enabling SPECULATION made it live.
         let per_step = self.tokens_per_step.max(1);
         for id in advanced {
             if let Some(seq) = self.running.get_mut(id) {
@@ -646,7 +646,7 @@ mod tests {
     /// `tolerable_itl_ms` both divide by `tokens_emitted`, so booking one token
     /// per advancing sequence while the engine emits two would make every
     /// sequence look further behind than it is and the controller steer against
-    /// a fiction. Enabling SPEC_DECODE is what made it live.
+    /// a fiction. Enabling SPECULATION is what made it live.
     #[test]
     fn a_speculating_step_books_more_than_one_token() {
         let mk = || DecodeScheduler::new(20.0, ItlController::new(20.0, 8.0, 1.0, 8.0));

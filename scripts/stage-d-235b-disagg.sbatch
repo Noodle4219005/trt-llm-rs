@@ -421,7 +421,7 @@ fi
 #
 # Default OFF: this is transferred evidence from a different serving stack, and
 # whether TRT-LLM's Eagle3 path reproduces the ratio is what a run settles.
-: "${SPEC_DECODE:=0}"
+: "${SPECULATION:=0}"
 : "${SPEC_MODEL:=/work/u4063814/hf_cache/eagle3/qwen3-235b-instruct-2507-specforge}"
 : "${SPEC_DRAFT_TOKENS:=1}"
 
@@ -559,7 +559,21 @@ write_engine_yaml () {
       # Prefill's in-flight budget. Decode leaves max_num_tokens alone: its
       # iterations carry one token per sequence, not whole prompts.
       echo "max_num_tokens: ${PREFILL_MAX_NUM_TOKENS}"
-    elif [ "${SPEC_DECODE}" != 0 ]; then
+    fi
+    if [ "${SPECULATION}" != 0 ]; then
+      # BOTH roles, not just decode. Job 325664 configured it on the decode
+      # workers only: all six workers registered, the engine accepted the
+      # config, and every request then failed with "Error in kv cache transfer
+      # for generation requests". The mechanism is
+      # CacheTransferLayer::validateSupport -> CacheFormatter::inquireSupport,
+      # which compares the context and generation executors' cacheState and
+      # rejects a mismatch -- eagle3_one_model builds a different model on the
+      # decode side, so the two no longer describe the same cache.
+      #
+      # NVIDIA's own disaggregated benchmark config carries speculative_config
+      # in both its ctx and gen sections (examples/disaggregated/slurm/
+      # benchmark/config.yaml:115 and :138). The prefill worker does not draft
+      # anything; it needs the matching cache layout.
       echo "speculative_config:"
       echo "  decoding_type: Eagle3"
       echo "  speculative_model: ${SPEC_MODEL}"
@@ -599,7 +613,7 @@ write_engine_yaml () {
       # silently misses every speculative step -- the same class of failure as
       # max_batch_size 0, which is configured, enabled, and does nothing.
       graph_cap="${CUDA_GRAPH_MAX_BATCH}"
-      if [ "$role" = decode ] && [ "${SPEC_DECODE}" != 0 ]; then
+      if [ "$role" = decode ] && [ "${SPECULATION}" != 0 ]; then
         graph_cap=$(( CUDA_GRAPH_MAX_BATCH * (1 + SPEC_DRAFT_TOKENS) ))
       fi
       echo "  max_batch_size: ${graph_cap}"

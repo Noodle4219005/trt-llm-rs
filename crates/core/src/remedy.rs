@@ -125,7 +125,7 @@ impl CapacityModel {
     ) -> bool {
         match r.knob {
             "DECODE_TP" => split.decode_tp == 4,
-            "SPEC_DECODE" => self.decode.speculation.is_some() || applied.speculation.enabled,
+            "SPECULATION" => self.decode.speculation.is_some() || applied.speculation.enabled,
             "KV_XFER_CONCURRENCY" => self.xfer_concurrency >= 16,
             "EXPERT_PARALLEL" => applied.expert_parallel == 1,
             "MOE_BACKEND" => applied.moe_backend == "CUTLASS" || applied.moe_backend == "AUTO",
@@ -247,7 +247,7 @@ impl CapacityModel {
     fn decode_remedies() -> Vec<Remedy> {
         vec![
             Remedy {
-                knob: "SPEC_DECODE",
+                knob: "SPECULATION",
                 setting: "1",
                 multiplier: 19.18 / 11.08,
                 evidence: Evidence::Transferred,
@@ -478,7 +478,7 @@ mod applied_tests {
         let knobs: Vec<&str> = r.iter().map(|x| x.knob).collect();
         assert_eq!(
             knobs,
-            vec!["SPEC_DECODE"],
+            vec!["SPECULATION"],
             "everything else is already configured; got {knobs:?}"
         );
     }
@@ -508,7 +508,7 @@ mod applied_tests {
             .map(|x| x.knob)
             .collect();
         assert!(
-            !knobs.contains(&"SPEC_DECODE"),
+            !knobs.contains(&"SPECULATION"),
             "speculation is on and must not be offered again: {knobs:?}"
         );
         assert!(
