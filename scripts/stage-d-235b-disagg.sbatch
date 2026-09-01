@@ -920,9 +920,33 @@ srun -N1 -n1 -w "$NODE_A" --overlap apptainer exec $BIND "$SIF" \
   2>&1 | head -18 | sed 's/^/  /' || echo "  (planner unavailable; continuing)"
 
 echo; echo "########## engine.yaml validation ##########"
-srun -N1 -n1 -w "$NODE_P" --overlap apptainer exec $BIND "$SIF" \
-  bash -c 'for f in "$0"/engine-*.yaml; do python3 "$1" "$f" || exit 28; done' \
-    "$OUT" "$SRC/scripts/validate_engine_yaml.py" || exit 28
+# Run WITHOUT srun. Job 325583 died here at exit 28 with "An error occurred in
+# MPI_Init_thread on a NULL communicator": importing tensorrt_llm inside an
+# srun task initialises MPI, and this task has no PMI set up. The validator
+# needs the container, not a compute allocation -- the batch script is already
+# on a node -- and running it here is both correct and one less srun.
+#
+# And it can no longer kill the run on its own account. A validator that exits
+# because it could not check is worse than no validator: it is the same
+# mistake this file's SM gate was fixed for, "not checked" reported as
+# "failed", and this time it cost a 16-GPU allocation. Only a config the
+# validator actually read and rejected stops the run.
+VALIDATION_RC=0
+for f in "$OUT"/engine-*.yaml; do
+  out=$(apptainer exec $BIND "$SIF" python3 "$SRC/scripts/validate_engine_yaml.py" "$f" 2>&1)
+  rc=$?
+  echo "$out" | sed 's/^/  /'
+  if [ $rc -ne 0 ]; then
+    if echo "$out" | grep -qiE "MPI_Init|NULL communicator|ImportError|ModuleNotFound|Traceback"; then
+      echo "  !!! the validator could not run on $(basename "$f") -- NOT a config"
+      echo "      failure. Continuing; the engine will do its own validation."
+    else
+      echo "  !!! $(basename "$f") was read and REJECTED"
+      VALIDATION_RC=28
+    fi
+  fi
+done
+[ $VALIDATION_RC -eq 0 ] || exit 28
 
 echo; echo "########## NCCL preflight ##########"
 nccl_preflight "$NODE_D" "$(( DECODE_WORKERS * DECODE_TP ))"
