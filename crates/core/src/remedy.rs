@@ -84,6 +84,15 @@ impl CapacityModel {
     /// Remedies for `split`, strongest evidence first and largest first within
     /// a level.
     pub fn remedies(&self, split: &PdSplit) -> Vec<Remedy> {
+        self.remedies_given(split, &crate::engine_config::EngineConfig::default())
+    }
+
+    /// Remedies for `split`, excluding everything `applied` already does.
+    pub fn remedies_given(
+        &self,
+        split: &PdSplit,
+        applied: &crate::engine_config::EngineConfig,
+    ) -> Vec<Remedy> {
         let b = self.prefill.mfu_breakdown();
         let mut out = match split.bottleneck {
             Bottleneck::KvTransfer => Self::transfer_remedies(),
@@ -94,7 +103,7 @@ impl CapacityModel {
         // current configuration is noise, and noise in a list ordered by
         // evidence is worse than noise anywhere else -- it occupies the slot a
         // reader trusts most.
-        out.retain(|r| !self.already_applied(r, split));
+        out.retain(|r| !self.already_applied(r, split, applied));
         out.sort_by(|a, b| {
             b.evidence
                 .cmp(&a.evidence)
@@ -108,12 +117,29 @@ impl CapacityModel {
     /// Only the knobs the model can see. The rest live in the launcher's
     /// environment, which this crate deliberately does not read -- a model
     /// that parses the deployment to describe it would be describing itself.
-    fn already_applied(&self, r: &Remedy, split: &PdSplit) -> bool {
+    fn already_applied(
+        &self,
+        r: &Remedy,
+        split: &PdSplit,
+        applied: &crate::engine_config::EngineConfig,
+    ) -> bool {
         match r.knob {
             "DECODE_TP" => split.decode_tp == 4,
-            // Speculation is in the decode calibration, not the launcher.
-            "SPEC_DECODE" => self.decode.speculation.is_some(),
+            "SPEC_DECODE" => self.decode.speculation.is_some() || applied.speculation.enabled,
             "KV_XFER_CONCURRENCY" => self.xfer_concurrency >= 16,
+            "EXPERT_PARALLEL" => applied.expert_parallel == 1,
+            "MOE_BACKEND" => applied.moe_backend == "CUTLASS" || applied.moe_backend == "AUTO",
+            "TORCH_COMPILE" => applied.torch_compile != "0",
+            "HOST_DISPATCH_SPIN" => applied.host_dispatch_spin,
+            "ALLREDUCE_STRATEGY" => applied.allreduce_strategy != "AUTO",
+            "CONTEXT_PARALLEL" => applied.context_parallel > 1,
+            "CUDA_GRAPH_MAX_BATCH" => applied.cuda_graph_max_batch > 0,
+            // These two describe the deployment rather than the engine
+            // section, so the model reads them from itself: the KV dtype is
+            // already in kv_dtype_bytes and the prefill budget in
+            // max_num_tokens.
+            "KV_CACHE_DTYPE" => self.kv_dtype_bytes <= 1.0,
+            "PREFILL_MAX_NUM_TOKENS" => self.max_num_tokens >= 16384,
             _ => false,
         }
     }
@@ -427,6 +453,100 @@ mod tests {
         let tp = r.iter().find(|x| x.knob == "DECODE_TP");
         if let Some(tp) = tp {
             assert_eq!(tp.evidence, Evidence::Measured);
+        }
+    }
+}
+
+#[cfg(test)]
+mod applied_tests {
+    use super::*;
+    use crate::engine_config::EngineConfig;
+
+    /// The filter is the point of the list, and it was half-built.
+    ///
+    /// It covered DECODE_TP and KV_XFER_CONCURRENCY while EXPERT_PARALLEL,
+    /// KV_CACHE_DTYPE and PREFILL_MAX_NUM_TOKENS were all defaults and all
+    /// still offered -- three lines telling a reader to do what they already
+    /// do, at the top of a list ordered by evidence, which is the exact
+    /// failure the doc comment above warns about.
+    #[test]
+    fn the_default_deployment_has_one_thing_left_to_try() {
+        let m = CapacityModel::default();
+        let e = EngineConfig::default();
+        let split = m.evaluate(8, 8, 2, 4);
+        let r = m.remedies_given(&split, &e);
+        let knobs: Vec<&str> = r.iter().map(|x| x.knob).collect();
+        assert_eq!(
+            knobs,
+            vec!["SPEC_DECODE"],
+            "everything else is already configured; got {knobs:?}"
+        );
+    }
+
+    /// Taking the last decode remedy moves the constraint, and the list must
+    /// follow it rather than empty out.
+    ///
+    /// With speculation on, decode goes 15.38 -> 26.62 req/s and the binding
+    /// resource flips to prefill -- which is what the 2026-08-28 analysis
+    /// predicted ("only speculation is -5%, only prefill is capped at 15.4").
+    /// The four prefill levers it then offers are genuinely untried, so an
+    /// empty list here would mean the model had stopped looking.
+    #[test]
+    fn taking_the_last_decode_remedy_moves_the_constraint_to_prefill() {
+        let mut cfg = crate::config::Config::default();
+        cfg.engine.speculation.enabled = true;
+        let m = cfg.capacity_model();
+        let split = m.evaluate(8, 8, 2, 4);
+        assert_eq!(
+            split.bottleneck,
+            Bottleneck::Prefill,
+            "speculation should make prefill the constraint"
+        );
+        let knobs: Vec<&str> = m
+            .remedies_given(&split, &cfg.engine)
+            .iter()
+            .map(|x| x.knob)
+            .collect();
+        assert!(
+            !knobs.contains(&"SPEC_DECODE"),
+            "speculation is on and must not be offered again: {knobs:?}"
+        );
+        assert!(
+            knobs.contains(&"TORCH_COMPILE"),
+            "the compute-MFU lever is the largest untried one: {knobs:?}"
+        );
+    }
+
+    /// A deployment that has NOT applied them must still be told. The filter
+    /// must remove what is done, not the knowledge itself.
+    #[test]
+    fn a_stock_deployment_is_told_everything() {
+        let m = CapacityModel {
+            kv_dtype_bytes: 2.0,
+            max_num_tokens: 8192,
+            ..CapacityModel::default()
+        };
+        let e = EngineConfig {
+            expert_parallel: 4,
+            ..EngineConfig::default()
+        };
+        // Prefill-bound, so the prefill remedies are the ones on offer.
+        let split = m.evaluate(4, 12, 2, 4);
+        assert_eq!(split.bottleneck, Bottleneck::Prefill);
+        let knobs: Vec<&str> = m
+            .remedies_given(&split, &e)
+            .iter()
+            .map(|x| x.knob)
+            .collect();
+        for expected in [
+            "EXPERT_PARALLEL",
+            "KV_CACHE_DTYPE",
+            "PREFILL_MAX_NUM_TOKENS",
+        ] {
+            assert!(
+                knobs.contains(&expected),
+                "{expected} was filtered out of a deployment that has not applied it: {knobs:?}"
+            );
         }
     }
 }

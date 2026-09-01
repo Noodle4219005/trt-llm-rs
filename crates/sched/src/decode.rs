@@ -347,6 +347,18 @@ pub struct DecodeScheduler {
     /// able to absorb before another sequence is let in. 1.0 is break-even;
     /// above 1.0 keeps a margin against the step getting slower.
     risk_margin: f64,
+    /// Tokens one accepted step emits per sequence. 1 without speculation,
+    /// 1 + draft_tokens with it.
+    ///
+    /// This is the ceiling, not the expectation: EAGLE3 at one draft token
+    /// emits two on acceptance and one on rejection, and the acceptance rate
+    /// (1.82 measured elsewhere) is not known on this stack. Overstating it
+    /// would make `remaining_tokens` finish sequences early. The engine tells
+    /// us which sequences advanced, not by how much, so the honest options are
+    /// this ceiling or a per-request delta from the bridge -- and the bridge
+    /// already reports `tokens_generated`, which is the delta's source when
+    /// someone wires it.
+    tokens_per_step: u32,
     admitted: u64,
     refused: u64,
     /// Sequences the engine did not report as finished, even though our own
@@ -373,6 +385,7 @@ impl DecodeScheduler {
             controller,
             itl_budget_ms,
             risk_margin: 1.05,
+            tokens_per_step: 1,
             admitted: 0,
             refused: 0,
             finish_disagreements: 0,
@@ -475,6 +488,19 @@ impl DecodeScheduler {
     /// the latency AIPerf scored was 91 ms. Step time equals ITL only while
     /// every resident request advances every step, and a controller that
     /// assumes it is blind in precisely the regime it exists for.
+    /// Tell the scheduler how many tokens one accepted step emits.
+    ///
+    /// `1 + draft_tokens` under speculation. Set it from the same place that
+    /// sets `speculative_config`, or the two disagree and the scheduler steers
+    /// against a token count the engine is not producing.
+    pub fn set_tokens_per_step(&mut self, tokens: u32) {
+        self.tokens_per_step = tokens.max(1);
+    }
+
+    pub fn tokens_per_step(&self) -> u32 {
+        self.tokens_per_step
+    }
+
     pub fn on_step(
         &mut self,
         now: Millis,
@@ -494,9 +520,21 @@ impl DecodeScheduler {
         let steer = self.steering_itl_ms(now).unwrap_or(step_ms);
         self.controller.observe(steer, self.running.len());
 
+        // One appearance is not one token under speculation: a verified step
+        // emits 1 + accepted drafts. Booking one each would understate
+        // `tokens_emitted`, which `remaining_tokens` and `tolerable_itl_ms`
+        // both divide by, so a speculating deployment would think every
+        // sequence was further behind than it is and steer against a fiction.
+        //
+        // ADR 0036 recorded this as a latent defect that could not be verified
+        // while the SU budget was withdrawn. Enabling SPEC_DECODE made it live.
+        let per_step = self.tokens_per_step.max(1);
         for id in advanced {
             if let Some(seq) = self.running.get_mut(id) {
-                seq.tokens_emitted += 1;
+                seq.tokens_emitted = seq
+                    .tokens_emitted
+                    .saturating_add(per_step)
+                    .min(seq.requested_tokens);
                 seq.last_token_ms = now;
             }
         }
@@ -601,6 +639,63 @@ impl DecodeScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One appearance is not one token under speculation.
+    ///
+    /// ADR 0036 recorded this as a latent defect: `remaining_tokens` and
+    /// `tolerable_itl_ms` both divide by `tokens_emitted`, so booking one token
+    /// per advancing sequence while the engine emits two would make every
+    /// sequence look further behind than it is and the controller steer against
+    /// a fiction. Enabling SPEC_DECODE is what made it live.
+    #[test]
+    fn a_speculating_step_books_more_than_one_token() {
+        let mk = || DecodeScheduler::new(20.0, ItlController::new(20.0, 8.0, 1.0, 8.0));
+        let mut plain = mk();
+        let mut spec = mk();
+        spec.set_tokens_per_step(2); // EAGLE3 at one draft token
+
+        plain.admit_at(RunningSeq::new(RequestId(1), 0.0, 200), 0.0);
+        spec.admit_at(RunningSeq::new(RequestId(1), 0.0, 200), 0.0);
+        for step in 1..=10 {
+            let now = f64::from(step) * 12.0;
+            plain.on_step(now, 12.0, &[RequestId(1)], &[]);
+            spec.on_step(now, 12.0, &[RequestId(1)], &[]);
+        }
+
+        let p = *plain.running().next().expect("plain seq");
+        let q = *spec.running().next().expect("spec seq");
+        assert_eq!(p.tokens_emitted, 11, "1 at admission plus ten steps");
+        assert_eq!(q.tokens_emitted, 21, "1 at admission plus ten double steps");
+        assert!(
+            q.remaining_tokens() < p.remaining_tokens(),
+            "the speculating sequence must be further ahead, not behind"
+        );
+    }
+
+    /// The count must not run past what was asked for, or a sequence would be
+    /// reported as owing negative work.
+    #[test]
+    fn speculation_cannot_overshoot_the_requested_length() {
+        let mut s = DecodeScheduler::new(20.0, ItlController::new(20.0, 8.0, 1.0, 8.0));
+        s.set_tokens_per_step(4);
+        s.admit_at(RunningSeq::new(RequestId(1), 0.0, 10), 0.0);
+        for step in 1..=10 {
+            s.on_step(f64::from(step) * 12.0, 12.0, &[RequestId(1)], &[]);
+        }
+        let seq = s.running().next().copied();
+        if let Some(seq) = seq {
+            assert!(seq.tokens_emitted <= 10, "{}", seq.tokens_emitted);
+            assert_eq!(seq.remaining_tokens(), 0);
+        }
+    }
+
+    /// Zero would stall every sequence for ever; the setter must refuse it.
+    #[test]
+    fn tokens_per_step_is_at_least_one() {
+        let mut s = DecodeScheduler::new(20.0, ItlController::new(20.0, 8.0, 1.0, 8.0));
+        s.set_tokens_per_step(0);
+        assert_eq!(s.tokens_per_step(), 1);
+    }
 
     fn seq_at(emitted: u32, elapsed: f64, requested: u32) -> RunningSeq {
         RunningSeq {

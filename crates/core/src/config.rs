@@ -115,7 +115,20 @@ impl Config {
             osl: self.workload.osl,
             slo: self.slo,
             prefill: self.calibration.prefill,
-            decode: self.calibration.decode,
+            // The engine's speculation setting drives the model's, or `plan`
+            // predicts for a deployment the launcher is not running. This is
+            // the same class of drift the deployment test exists for, one
+            // level further in: the launcher and the config agreed while the
+            // capacity model quietly did not.
+            decode: DecodeCalibration {
+                speculation: self.engine.speculation.enabled.then(|| {
+                    crate::capacity::Speculation {
+                        draft_tokens: self.engine.speculation.draft_tokens,
+                        ..crate::capacity::Speculation::eagle3_topk1()
+                    }
+                }),
+                ..self.calibration.decode
+            },
             good_frac: self.calibration.assumed_good_frac,
             itl_safety: self.scheduler.itl_safety,
             // Derived from the model shape rather than restated, so the

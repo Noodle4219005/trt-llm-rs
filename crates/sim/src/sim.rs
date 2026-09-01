@@ -119,16 +119,23 @@ impl Simulator {
 
         let mut decode = Vec::new();
         for _ in 0..t.decode_workers {
-            decode.push(DecodeWorkerSim {
-                sched: DecodeScheduler::new(
-                    cfg.slo.itl_ms,
-                    ItlController::new(
-                        itl_target,
-                        initial_cap,
-                        8.0,
-                        f64::from(cfg.scheduler.max_decode_seqs),
-                    ),
+            let mut sched = DecodeScheduler::new(
+                cfg.slo.itl_ms,
+                ItlController::new(
+                    itl_target,
+                    initial_cap,
+                    8.0,
+                    f64::from(cfg.scheduler.max_decode_seqs),
                 ),
+            );
+            // Same engine, same token count -- a simulator that books one
+            // token per step while the deployment books two would predict for
+            // a configuration nobody runs.
+            if cfg.engine.speculation.enabled {
+                sched.set_tokens_per_step(1 + cfg.engine.speculation.draft_tokens);
+            }
+            decode.push(DecodeWorkerSim {
+                sched,
                 curve: decode_curve,
                 pending: VecDeque::new(),
                 stepping: false,

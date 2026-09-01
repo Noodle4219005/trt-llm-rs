@@ -231,7 +231,7 @@ fn main() -> Result<()> {
                     bottleneck: b,
                     ..split
                 };
-                let remedies = model.remedies(&implicated);
+                let remedies = model.remedies_given(&implicated, &cfg.engine);
                 if remedies.is_empty() {
                     println!();
                     println!("Every remedy this model knows for {b:?} is already applied.");
@@ -365,7 +365,7 @@ fn cmd_plan(cfg: &Config, total_gpus: u32, prefill_tp: &[u32], decode_tp: &[u32]
         .next()
     {
         println!();
-        let remedies = model.remedies(&best);
+        let remedies = model.remedies_given(&best, &cfg.engine);
         if remedies.is_empty() {
             println!(
                 "Best split binds on {:?}, and every remedy this model knows \

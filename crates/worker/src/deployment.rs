@@ -117,7 +117,7 @@ impl Deployment {
         let (devent_tx, devent_rx) = mpsc::channel::<DecodeEvent>(CHANNEL_DEPTH);
 
         for (j, engine) in decode_engines.into_iter().enumerate() {
-            let sched = DecodeScheduler::new(
+            let mut sched = DecodeScheduler::new(
                 cfg.slo.itl_ms,
                 ItlController::new(
                     itl_target,
@@ -126,6 +126,13 @@ impl Deployment {
                     f64::from(cfg.scheduler.max_decode_seqs),
                 ),
             );
+            // Speculation emits more than one token per accepted step, and
+            // `remaining_tokens` and `tolerable_itl_ms` both divide by the
+            // count. Setting it here keeps the scheduler and
+            // `speculative_config` describing the same engine.
+            if cfg.engine.speculation.enabled {
+                sched.set_tokens_per_step(1 + cfg.engine.speculation.draft_tokens);
+            }
             let w = Arc::new(DecodeWorker::new(
                 WorkerId(DECODE_ID_BASE + j as u32),
                 engine,

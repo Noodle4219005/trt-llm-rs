@@ -217,3 +217,34 @@ fn the_committed_deployment_env_is_current() {
          `trt-llm-rs config --emit-env > deployment.env`"
     );
 }
+
+/// Turning speculation on in the config must change what the model predicts.
+///
+/// The launcher and the config agree by construction now, but the capacity
+/// model is a third party and was reading its own `calibration.decode`. A
+/// deployment running EAGLE3 while `plan` predicted without it would print a
+/// number for a configuration nobody was running -- which is the failure the
+/// launcher's own prediction banner exists to prevent.
+#[test]
+fn enabling_speculation_changes_the_prediction() {
+    let plain = Config::default();
+    assert!(!plain.engine.speculation.enabled, "the default is off");
+    assert!(plain.capacity_model().decode.speculation.is_none());
+
+    let mut spec = Config::default();
+    spec.engine.speculation.enabled = true;
+    let m = spec.capacity_model();
+    let s = m
+        .decode
+        .speculation
+        .expect("the model must follow the engine");
+    assert_eq!(s.draft_tokens, spec.engine.speculation.draft_tokens);
+
+    // And it must be worth something, or the plumbing is decorative.
+    let before = plain.capacity_model().evaluate(8, 8, 2, 4).decode_req_s;
+    let after = m.evaluate(8, 8, 2, 4).decode_req_s;
+    assert!(
+        after > before * 1.3,
+        "speculation should lift decode capacity: {before:.2} -> {after:.2}"
+    );
+}
