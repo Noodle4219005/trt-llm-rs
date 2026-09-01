@@ -165,6 +165,21 @@ impl EngineConfig {
                         it at the default."
                 .into());
         }
+        // Qwen3-MoE has its own eager fusion, on by default
+        // (modeling_qwen3_moe.py:203, TRTLLM_QWEN3_EAGER_FUSION_DISABLED
+        // defaults to "0"), and line 205 is `self.enable_fusion &= not
+        // self.enable_attention_dp`. The fusion folds the attention all-reduce
+        // into the pre-MoE step -- `disable_attn_allreduce` at :212 is set
+        // *because* PRE_MOE_FUSION is on -- so turning attention DP on trades
+        // a fused collective for an unfused one on a model whose all-reduce is
+        // 25% of prefill kernel time.
+        //
+        // Not an error: attention DP is a real technique and someone may want
+        // it. But it must not be a silent trade.
+        if self.prefill_attention_dp {
+            return Err("prefill_attention_dp = true disables the Qwen3-MoE                         eager fusion (modeling_qwen3_moe.py:205), which folds                         the attention all-reduce into the pre-MoE step. That                         all-reduce is 25% of prefill kernel time here. Set it                         only deliberately."
+                .into());
+        }
         if self.context_parallel > 1 && self.speculation.enabled {
             return Err("context_parallel and speculation have not been run \
                         together on this stack. Enable one."

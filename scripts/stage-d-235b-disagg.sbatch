@@ -425,6 +425,49 @@ fi
 : "${SPEC_MODEL:=/work/u4063814/hf_cache/eagle3/qwen3-235b-instruct-2507-specforge}"
 : "${SPEC_DRAFT_TOKENS:=1}"
 
+# ---------------------------------------------------------------------------
+# WHAT SM90 ALREADY DOES, AND THE ONE TRANSFER KNOB THAT IS STILL LIVE.
+#
+# The XQA decode kernel is already selected on this configuration and needs no
+# flag. `DecoderXQARunner::shouldUse` passes three ways
+# (decoderXQARunner.cpp:54): supportConfig accepts SM90 + BF16 compute + E4M3
+# KV + beam 1 + head_dim 128 with head_grp_size 64/4 = 16 <= 32
+# (kernelUtils.cpp:135); mayHavePerfGain passes on occupancy, 4 KV heads x 96
+# batch x 4 = 1536 against 132 SMs (:166); and there is an fp8-KV escape hatch
+# at :82 for when it does not. TRTLLM_FORCE_XQA only short-circuits the second
+# of those, so setting it changes nothing here.
+#
+# KV_CACHE_DTYPE=fp8 is therefore not only a memory decision. kernelUtils.cpp:123
+# requires kv_cache_data_type == DATA_TYPE_E4M3 for the QGMMA XQA path: fp16 KV
+# would drop decode onto masked MHA. Do not "revert" it to save a variable.
+#
+# Also already on, and worth not breaking:
+#   TRTLLM_ENABLE_PDL              defaults to "1" -- programmatic dependent
+#                                  launch, the Hopper feature that overlaps one
+#                                  kernel's tail with the next one's head
+#   Qwen3 eager fusion             modeling_qwen3_moe.py:203, default enabled,
+#                                  folds the attention all-reduce into pre-MoE.
+#                                  PREFILL_ATTENTION_DP=1 turns it OFF.
+#   MoE finalize fusion            MoeConfig.disable_finalize_fusion is False
+#
+# Unavailable here, checked rather than assumed:
+#   GEMM+AllReduce fusion          linear.py:3271 requires get_sm_version() >= 100
+#                                  and NVFP4; the SM90 kernel registry is empty
+#                                  because its guard is `bits_input >= 8`
+#   MMHA multi-block knobs         unreachable: XQA wins the dispatch
+#   TRTLLM_ENABLE_CASCADE_MMHA     needs beam search AND non-FP8 KV
+#
+# Live: the ctx and gen workers run different TP (2 and 4), so each decode rank
+# pulls from more than one prefill peer and cacheFormatter.cpp:986 takes its
+# parallel branch instead of the sequential loop. This is exactly the case the
+# variable exists for.
+#
+# The mirror image, TRTLLM_TRY_ZCOPY_FOR_KVCACHE_TRANSFER, sends straight out of
+# the KV pool with no bounce buffer -- and requires IDENTICAL TP and PP on both
+# sides (cacheFormatter.cpp:497). Narrow prefill and zero-copy transfer are
+# mutually exclusive, and that trade has not been measured.
+: "${KVCACHE_RECEIVE_PARALLEL:=1}"
+
 # Off upstream, and left off deliberately. Chunked prefill exists to interleave
 # a long prompt with decode work in the same iteration, and a disaggregated
 # prefill worker has no decode work to interleave with. At ISL 4000 against
@@ -737,6 +780,7 @@ launch_worker () {
     --env "TRTLLM_RS_MMAP_WEIGHTS=1" \
     --env "TRTLLM_REQUEST_KV_CACHE_CONCURRENT=1" \
     --env "TRTLLM_KVCACHE_RECV_BUFFER_COUNT=${KV_XFER_CONCURRENCY}" \
+    --env "TRTLLM_ENABLE_KVCACHE_RECEIVE_PARALLEL=${KVCACHE_RECEIVE_PARALLEL}" \
     --env "TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM=${KV_XFER_CONCURRENCY}" \
     --env "TRTLLM_RS_SHADOW_OUT=$OUT/bridge-$tag" \
     --env "TRTLLM_RS_ITL_BUDGET_MS=20.0" \

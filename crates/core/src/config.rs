@@ -77,6 +77,10 @@ impl Config {
 
         put("KV_XFER_CONCURRENCY", self.kv.xfer_concurrency.to_string());
         put(
+            "KVCACHE_RECEIVE_PARALLEL",
+            if self.kv.receive_parallel { "1" } else { "0" }.to_string(),
+        );
+        put(
             "MAX_TOKENS_IN_BUFFER",
             self.kv.max_tokens_in_buffer.to_string(),
         );
@@ -379,6 +383,16 @@ pub struct KvConfig {
     /// P/D transport: UCX, NIXL, MPI, DEFAULT. DEFAULT resolves to NIXL, which
     /// FileLocks a hardcoded path under the node-shared /tmp.
     pub xfer_backend: String,
+    /// Receive a request's KV from several prefill peers at once.
+    ///
+    /// Only does anything when a decode rank pulls from more than one peer,
+    /// which happens when the two sides run different TP
+    /// (cacheFormatter.cpp:986). This deployment runs TP2 prefill and TP4
+    /// decode, so it applies. Its mirror image,
+    /// TRTLLM_TRY_ZCOPY_FOR_KVCACHE_TRANSFER, needs identical TP and PP on both
+    /// sides (cacheFormatter.cpp:497) -- narrow prefill and zero-copy transfer
+    /// cannot both be had, and which is worth more has not been measured.
+    pub receive_parallel: bool,
 }
 
 impl Default for KvConfig {
@@ -391,6 +405,7 @@ impl Default for KvConfig {
             xfer_concurrency: 16,
             max_tokens_in_buffer: 4096,
             xfer_backend: "UCX".into(),
+            receive_parallel: true,
         }
     }
 }
