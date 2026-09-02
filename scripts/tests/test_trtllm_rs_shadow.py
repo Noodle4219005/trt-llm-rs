@@ -82,20 +82,20 @@ class DepartureLedgerTests(unittest.TestCase):
 
     def test_a_request_that_finished_is_completed(self):
         state = shadow.ShadowState()
-        state.token_progress[7] = (0.0, 200, 200)
+        state.token_progress[7] = (0.0, 0.0, 200, 200)
         state.retire_departed(set())
         self.assertEqual((state.completed, state.stranded), (1, 0))
 
     def test_a_request_that_vanished_early_is_stranded(self):
         state = shadow.ShadowState()
-        state.token_progress[7] = (0.0, 3, 200)
+        state.token_progress[7] = (0.0, 0.0, 3, 200)
         state.retire_departed(set())
         self.assertEqual((state.completed, state.stranded), (0, 1))
         self.assertEqual(state.stranded_tokens_short, 197)
 
     def test_a_request_still_being_offered_is_not_retired(self):
         state = shadow.ShadowState()
-        state.token_progress[7] = (0.0, 3, 200)
+        state.token_progress[7] = (0.0, 0.0, 3, 200)
         state.retire_departed({7})
         self.assertEqual((state.completed, state.stranded), (0, 0))
         self.assertIn(7, state.token_progress)
@@ -105,49 +105,71 @@ class DepartureLedgerTests(unittest.TestCase):
         it; guessing "stranded" there would invent the very number this exists
         to measure."""
         state = shadow.ShadowState()
-        state.token_progress[7] = (0.0, 3, 0)
+        state.token_progress[7] = (0.0, 0.0, 3, 0)
         state.retire_departed(set())
         self.assertEqual((state.completed, state.stranded), (1, 0))
 
 
 class SteerSignalTests(unittest.TestCase):
-    """The controller steers on this. Job 326058 measured it at 5.7e-256 while
-    the real ITL was 21.2 ms, so the cap never came down and decode ran fully
-    oversubscribed -- the queueing the vLLM/SGLang admission model prevents."""
+    """The controller steers on this. It must be each request's mean ITL since
+    its first token -- AIPerf's own quantity -- not the instantaneous gap since
+    its last advance. Job 326091 measured the instantaneous version at 17 ms
+    while the true mean was 26, so the controller saw 17 < 20 and never
+    throttled the decode concurrency that was the queueing lever."""
 
-    def test_an_advancing_batch_reports_the_step_time_not_zero(self):
-        # Two running requests, both last seen 21 ms ago -- a healthy step.
-        prev = {1: 100.0, 2: 100.0}
+    def test_mean_itl_since_first_token(self):
+        # rid 1: 100 tokens produced, first seen 2600 ms ago -> mean 26.26 ms.
+        progress = {1: (0.0, 2570.0, 100, 200)}
         proj = shadow.ShadowState.project_steer(
-            ids=[1, 2], is_context=[False, False], prev_seen_ms=prev, now_ms=121.0
+            ids=[1], is_context=[False], progress=progress, now_ms=2600.0
         )
-        self.assertEqual(proj, [21.0, 21.0])
-        # The old bug: reading post-update timestamps (already now_ms) gave 0.
-        post = {1: 121.0, 2: 121.0}
-        broken = shadow.ShadowState.project_steer(
-            ids=[1, 2], is_context=[False, False], prev_seen_ms=post, now_ms=121.0
-        )
-        self.assertEqual(broken, [0.0, 0.0], "this is what the bug produced")
+        self.assertAlmostEqual(proj[0], 2600.0 / 99, places=3)
 
-    def test_a_stalled_request_dominates(self):
-        # One advancing (21 ms ago), one stalled (2 s ago).
-        prev = {1: 2100.0, 2: 100.0}
+    def test_a_stalled_request_reads_higher_than_a_healthy_one(self):
+        # rid 1 healthy: 100 tokens over 2000 ms -> ~20. rid 2 stalled: 5 tokens,
+        # first seen 4000 ms ago -> 1000. The stall must dominate.
+        progress = {1: (0.0, 1980.0, 100, 200), 2: (0.0, 100.0, 5, 200)}
         proj = shadow.ShadowState.project_steer(
-            ids=[1, 2], is_context=[False, False], prev_seen_ms=prev, now_ms=2121.0
+            ids=[1, 2], is_context=[False, False], progress=progress, now_ms=2000.0
         )
-        self.assertEqual(sorted(proj), [21.0, 2021.0])
+        self.assertLess(proj[0], 25)
+        self.assertGreater(proj[1], 400)
+
+    def test_a_request_with_one_token_has_no_itl_yet(self):
+        progress = {1: (0.0, 0.0, 1, 200)}
+        proj = shadow.ShadowState.project_steer(
+            ids=[1], is_context=[False], progress=progress, now_ms=500.0
+        )
+        self.assertEqual(proj, [], "one token means no inter-token gap yet")
 
     def test_context_requests_carry_no_itl(self):
-        prev = {1: 100.0}
+        progress = {1: (0.0, 500.0, 50, 200)}
         proj = shadow.ShadowState.project_steer(
-            ids=[1, 2], is_context=[False, True], prev_seen_ms=prev, now_ms=121.0
+            ids=[1, 2], is_context=[False, True], progress=progress, now_ms=1000.0
         )
-        self.assertEqual(proj, [21.0], "the context request has no ITL yet")
+        self.assertEqual(len(proj), 1, "the context request has no ITL")
 
-    def test_a_first_sight_request_is_skipped(self):
-        # rid 2 has no prior timestamp -- it just arrived, no ITL to report.
-        prev = {1: 100.0}
-        proj = shadow.ShadowState.project_steer(
-            ids=[1, 2], is_context=[False, False], prev_seen_ms=prev, now_ms=121.0
-        )
-        self.assertEqual(proj, [21.0])
+
+class CompletionOffByOneTests(unittest.TestCase):
+    """Job 326091 read 2383 requests as stranded at 1.14 tokens short on
+    average while advance_fraction was 0.976 -- healthy decode misread as mass
+    stranding, which made the stranding signal useless for diagnosing queueing."""
+
+    def test_one_token_short_is_completion_not_stranding(self):
+        state = shadow.ShadowState()
+        state.token_progress[7] = (0.0, 0.0, 199, 200)  # departs on the 200th token
+        state.retire_departed(set())
+        self.assertEqual((state.completed, state.stranded), (1, 0))
+
+    def test_a_real_strand_is_still_a_strand(self):
+        state = shadow.ShadowState()
+        state.token_progress[7] = (0.0, 0.0, 3, 200)  # job 316849 shape
+        state.retire_departed(set())
+        self.assertEqual((state.completed, state.stranded), (0, 1))
+        self.assertEqual(state.stranded_tokens_short, 197)
+
+    def test_exactly_at_budget_is_completion(self):
+        state = shadow.ShadowState()
+        state.token_progress[7] = (0.0, 0.0, 200, 200)
+        state.retire_departed(set())
+        self.assertEqual((state.completed, state.stranded), (1, 0))

@@ -133,25 +133,32 @@ class ShadowState:
     def project_steer(
         ids: list,
         is_context: list,
-        prev_seen_ms: dict,
+        progress: dict,
         now_ms: float,
     ) -> list:
-        """(now - previous-token time) for each running request.
+        """Each running request's mean ITL so far, projected to now.
 
-        `prev_seen_ms` must be the timestamps as they were BEFORE this step
-        updated token_progress. Passing the post-update map -- where an
-        advancing request's time is already now_ms -- yields 0 for every
-        healthy request and collapses the p90 to 0, which is the defect that
-        left the ITL controller blind (observed_itl_ms 5.7e-256 against a real
-        21.2 ms) and unable to throttle decode concurrency.
+        This is AIPerf's own quantity: (last_token - first_token) / (tokens - 1),
+        with `now` standing in for the next token so a request that is currently
+        stalled raises the signal while it is stalled. `progress[rid]` is
+        (first_ms, last_ms, produced, wanted).
+
+        The earlier version measured now - last_advance, the instantaneous gap,
+        and read 17 ms while the true mean ITL was 26 (job 326091): on a call
+        where a request had just advanced, the gap was one iteration, not the
+        mean over its life. The controller saw 17 < 20, never throttled, and the
+        queueing this signal exists to control went unmanaged.
         """
         out: list = []
         for i, rid in enumerate(ids):
             if is_context[i]:
                 continue
-            prev = prev_seen_ms.get(rid)
-            if prev is not None:
-                out.append(now_ms - prev)
+            entry = progress.get(rid)
+            if entry is None:
+                continue
+            first_ms, _last_ms, produced, _wanted = entry
+            if produced >= 2:
+                out.append((now_ms - first_ms) / (produced - 1))
         return out
 
     def retire_departed(self, live_ids: set) -> None:
@@ -164,8 +171,16 @@ class ShadowState:
         steps ago is gone.
         """
         for gone in [r for r in self.token_progress if r not in live_ids]:
-            _, produced, wanted = self.token_progress.pop(gone)
-            if wanted and produced < wanted:
+            _, _, produced, wanted = self.token_progress.pop(gone)
+            # A completed request departs at produced == wanted - 1, not
+            # wanted: the token that reaches the budget is the one that ends the
+            # request, and the last snapshot this seam took was before it. Job
+            # 326091 classified 2383 requests as stranded, 1.14 tokens short on
+            # average, while advance_fraction was 0.976 -- healthy decode read
+            # as mass stranding by an off-by-one. A real strand (job 316849)
+            # departs ~197 tokens short, so the tolerance of one separates the
+            # instrumentation lag from the failure without hiding it.
+            if wanted and produced < wanted - 1:
                 self.stranded += 1
                 self.stranded_tokens_short += wanted - produced
             else:
@@ -413,20 +428,6 @@ def install() -> bool:
             itl_samples: list[float] = []
             generating = 0
             live_ids: set[int] = set()
-            # Each running request's timestamp as it enters this step, captured
-            # BEFORE the loop below overwrites it. The steer projection has to
-            # read these: an advancing request has its token_progress set to
-            # now_ms in this same loop, so `now_ms - token_progress[rid][0]` is
-            # zero for exactly the requests that are healthy. The p90 of a batch
-            # that is mostly advancing then collapses to 0, which is why
-            # observed_itl_ms read 5.7e-256 against a real 21.2 ms ITL and the
-            # controller never throttled -- the admission control vLLM and
-            # SGLang get from their own step accounting was silently disabled.
-            prev_seen_ms: dict[int, float] = {
-                rid: STATE.token_progress[rid][0]
-                for rid in ids
-                if rid in STATE.token_progress
-            }
             for i, rid in enumerate(ids):
                 live_ids.add(rid)
                 if is_context[i]:
@@ -437,16 +438,23 @@ def install() -> bool:
                 wanted = max_new[i]
                 previous = STATE.token_progress.get(rid)
                 if previous is not None:
-                    prev_ms, prev_tokens, _ = previous
+                    first_ms, prev_ms, prev_tokens, _ = previous
                     advanced = produced - prev_tokens
                     if advanced > 0:
                         sample = (now_ms - prev_ms) / advanced
                         itl_samples.append(sample)
                         STATE.advanced_seen += 1
                         STATE.reservoir(STATE.advancing_itl, STATE.advancing_itl_count, sample)
-                        STATE.token_progress[rid] = (now_ms, produced, wanted)
+                        # first_ms is immutable -- it anchors the mean ITL.
+                        STATE.token_progress[rid] = (first_ms, now_ms, produced, wanted)
+                    # Not advanced: keep the tuple, so first_ms and the last
+                    # real advance time both stand and the stall shows up in the
+                    # mean projection below.
                 else:
-                    STATE.token_progress[rid] = (now_ms, produced, wanted)
+                    # First time this worker sees the request. In disagg it
+                    # arrives from prefill carrying token 1, so first_ms is the
+                    # decode-side admission and produced starts at 1.
+                    STATE.token_progress[rid] = (now_ms, now_ms, produced, wanted)
 
             # A request leaving the candidate list is TWO different events and
             # this loop used to treat them as one.
@@ -467,8 +475,10 @@ def install() -> bool:
             # cannot express. This is the cheap half of that discipline: keep the
             # ledger, and count the two departures apart.
             for gone in [r for r in STATE.token_progress if r not in live_ids]:
-                _, produced_at_exit, wanted_at_exit = STATE.token_progress.pop(gone)
-                if wanted_at_exit and produced_at_exit < wanted_at_exit:
+                _, _, produced_at_exit, wanted_at_exit = STATE.token_progress.pop(gone)
+                # produced == wanted - 1 at departure is completion, not a
+                # strand -- see retire_departed for the off-by-one this fixes.
+                if wanted_at_exit and produced_at_exit < wanted_at_exit - 1:
                     STATE.stranded += 1
                     STATE.stranded_tokens_short += wanted_at_exit - produced_at_exit
                 else:
@@ -499,7 +509,7 @@ def install() -> bool:
             # token was tried first and the simulator rejected it -- that
             # anchor precedes decode admission, so every freshly handed-off
             # request arrives carrying a latency decode concurrency cannot fix.
-            projected = STATE.project_steer(ids, is_context, prev_seen_ms, now_ms)
+            projected = STATE.project_steer(ids, is_context, STATE.token_progress, now_ms)
 
             if projected:
                 steer = _pct(projected, 0.90) or 0.0
