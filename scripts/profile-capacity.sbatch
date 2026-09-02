@@ -4,7 +4,7 @@
 #SBATCH -p 8gpus
 #SBATCH -N 1
 #SBATCH --ntasks-per-node=1
-#SBATCH -c 96
+#SBATCH -c 72
 #SBATCH --mem=0
 #SBATCH --gres=gpu:H200:6
 #SBATCH -t 00:35:00
@@ -66,7 +66,7 @@ launch () {                       # name node gpus tp role
     --env "TLLM_TORCH_PROFILE_TRACE=$OUT/$name-trace.json" \
     --env "TRTLLM_ENABLE_PDL=1" \
     --env "TRTLLM_RS_MMAP_WEIGHTS=1" \
-    "$SIF" mpirun --bind-to none --oversubscribe -H "$node:96" -n 1 \
+    "$SIF" mpirun --bind-to none --oversubscribe -H "$node:72" -n 1 \
       python3 "$OUT/profile_prefill_decode.py" \
       > "$OUT/$name.log" 2>&1 &
   echo "  launched $name on $node gpus=$gpus tp=$tp role=$role"
