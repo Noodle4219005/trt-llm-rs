@@ -23,6 +23,8 @@ from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import KvCacheConfig, MoeConfig
 
 MODEL = os.environ["MODEL"]
+ROLE = os.environ.get("PROF_ROLE", "both")   # prefill | decode | both
+TP = int(os.environ.get("PROF_TP", "2"))
 ISL = 4000
 
 
@@ -32,7 +34,7 @@ def main() -> None:
     # there rather than being read as a TP4 measurement.
     llm = LLM(
         model=MODEL,
-        tensor_parallel_size=2,
+        tensor_parallel_size=TP,
         moe_expert_parallel_size=1,
         max_num_tokens=16384,
         max_seq_len=4608,
@@ -44,10 +46,19 @@ def main() -> None:
         ),
         disable_overlap_scheduler=True,  # context servers, per the disagg docs
     )
-    out = {}
+    out = {"role": ROLE, "tp": TP}
 
-    # Phase A -- prefill. max_tokens=1 keeps every iteration a context
-    # iteration, so the timing is prefill and nothing else.
+    if ROLE in ("prefill", "both"):
+        _run_prefill(llm, out)
+    if ROLE in ("decode", "both"):
+        _run_decode(llm, out)
+    print("RESULT " + json.dumps(out), flush=True)
+    llm.shutdown()
+
+
+def _run_prefill(llm, out) -> None:
+    """max_tokens=1 keeps every iteration a context iteration, so the timing is
+    prefill and nothing else."""
     greedy1 = SamplingParams(max_tokens=1, temperature=0.0)
     prompt = [1234] * ISL
     batch = 4  # 4 x 4000 = 16000, just under max_num_tokens
@@ -67,17 +78,20 @@ def main() -> None:
         "batch": batch,
         "seconds": round(dt, 3),
         "tok_s_total": round(toks / dt, 1),
-        "tok_s_per_gpu": round(toks / dt / 2, 1),
+        "tok_s_per_gpu": round(toks / dt / TP, 1),
         "req_s": round(rounds * batch / dt, 3),
     }
-    print(json.dumps(out["prefill"]), flush=True)
+    print("PREFILL " + json.dumps(out["prefill"]), flush=True)
+
+
+def _run_decode(llm, out) -> None:
 
     # Phase B -- decode capacity, saturated. A short prompt so the 200 output
     # tokens dominate the measurement.
     short = [1234] * 128
     greedy200 = SamplingParams(max_tokens=200, temperature=0.0, ignore_eos=True)
     out["decode"] = []
-    for conc in (8, 16, 24, 32):
+    for conc in (16, 32, 48, 64):
         llm.generate([short] * 4, SamplingParams(max_tokens=8, temperature=0.0))
         t0 = time.perf_counter()
         res = llm.generate([short] * conc, greedy200)
@@ -90,14 +104,11 @@ def main() -> None:
             "tokens": got,
             # Wall clock over the gaps one sequence actually produced.
             "itl_ms": round(dt * 1000.0 / max(1.0, per_seq - 1.0), 3),
-            "tok_s_per_gpu": round(got / dt / 2, 1),
+            "tok_s_per_gpu": round(got / dt / TP, 1),
             "req_s": round(conc / dt, 3),
         }
         out["decode"].append(row)
-        print(json.dumps(row), flush=True)
-
-    print("RESULT " + json.dumps(out), flush=True)
-    llm.shutdown()
+        print("DECODE " + json.dumps(row), flush=True)
 
 
 if __name__ == "__main__":
