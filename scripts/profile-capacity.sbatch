@@ -16,8 +16,15 @@
 # concurrently rather than in series. A 2-GPU version of the same questions was
 # still loading at 30 minutes.
 #
-#   node A, GPUs 0-1   prefill TP2   the shape we run
-#   node A, GPUs 2-5   decode  TP4   the number nobody has: saturated decode
+#   node A, GPUs 0-1   decode  TP2   the 328143 decode trace put 46.12% of decode
+#                                    time in the TP4 all-reduce with a 28% gap;
+#                                    halving the ranks is the direct test, and it
+#                                    is what the capacity model has preferred
+#                                    while I dismissed it as untested
+#   node A, GPUs 2-5   prefill TP4   settles a live disagreement on OUR stack:
+#                                    our per-GPU numbers say TP2, the team's
+#                                    SGLang sweep says TP4, and cross-stack
+#                                    evidence has misled this project twice   the number nobody has: saturated decode
 #                                    capacity. Every disaggregated run was
 #                                    prefill-bound so this side never reached
 #                                    its ceiling, and it is exactly what decides
@@ -73,12 +80,12 @@ launch () {                       # name node gpus tp role
 }
 
 echo "=== launching three workers ==="
-launch prefill-tp2 "$NODE_A" 0,1     2 prefill
-launch decode-tp4  "$NODE_B" 2,3,4,5 4 decode
+launch decode-tp2  "$NODE_A" 0,1     2 decode
+launch prefill-tp4 "$NODE_A" 2,3,4,5 4 prefill
 wait
 
 echo; echo "=== results ==="
-for n in prefill-tp2 decode-tp4; do
+for n in decode-tp2 prefill-tp4; do
   echo "--- $n ---"
   grep -E "^(PREFILL|DECODE|RESULT) " "$OUT/$n.log" 2>/dev/null | sed 's/^/  /' \
     || echo "  (no result; tail follows)"
