@@ -324,7 +324,20 @@ impl Default for DecodeCalibration {
         Self {
             concurrency_per_gpu: 53.0 / 8.0,
             itl_ms_at_ref: 17.23,
-            itl_slope_ms: 0.10,
+            // 1.06 ms per sequence per GPU, measured. Three near-collinear
+            // points on the saturated curve -- N=53 at 17.23 ms
+            // (gwab-302350), N=64 at 19.00 and N=80 at 21.12 (job 311706) --
+            // give 0.1325 ms per unit of client concurrency across 8 decode
+            // GPUs. Extrapolating back to 53 predicts 17.54 against a measured
+            // 17.23.
+            //
+            // This was 0.10, fitted to an UNSATURATED N-sweep, and it is the
+            // reason the model kept recommending N=128 and never saw the
+            // cliff: at 0.10 ITL barely moves with concurrency, so there is no
+            // concurrency at which the 20 ms gate binds. At 1.06 the gate
+            // binds at N ~= 74, which is where the measured collapse is
+            // (goodput 13.77 at N=64 falling to 1.27 at N=80).
+            itl_slope_ms: 1.06,
             max_extrapolation: 1.0,
             speculation: None,
         }
@@ -830,9 +843,18 @@ mod tests {
         assert!((c - 53.0).abs() < 0.01, "expected the measured 53, got {c}");
     }
 
-    /// Extrapolating is possible, but only as an explicit, visible choice.
+    /// With the measured slope, the ITL curve binds before the extrapolation
+    /// cap does -- and it binds where the collapse was measured.
+    ///
+    /// This test used to assert 79.5, the 1.5x cap on the calibrated 53. That
+    /// held only while itl_slope_ms was 0.10, fitted to an unsaturated sweep,
+    /// under which ITL barely rose with concurrency and no concurrency ever
+    /// reached the 20 ms gate. At the measured 1.06 the gate binds at ~74,
+    /// which is where job 311706 measured goodput falling from 13.77 at N=64
+    /// to 1.27 at N=80 -- so the model now reproduces a cliff it was
+    /// previously blind to, from a calibration constant rather than a rule.
     #[test]
-    fn extrapolation_is_opt_in_and_shows_up_in_the_number() {
+    fn the_measured_slope_makes_the_gate_bind_before_the_extrapolation_cap() {
         let slo = Slo::default();
         let d = DecodeCalibration {
             max_extrapolation: 1.5,
@@ -840,7 +862,16 @@ mod tests {
             ..Default::default()
         };
         let c = d.max_concurrency_for_slo(8, &slo, 1.0);
-        assert!((c - 79.5).abs() < 0.01, "{c}");
+        assert!(
+            (c - 73.9).abs() < 0.5,
+            "the 20 ms gate should bind near 74, got {c}"
+        );
+        assert!(
+            c < 53.0 * 1.5,
+            "the extrapolation cap {} should no longer be what binds; the \
+             physics does",
+            53.0 * 1.5
+        );
         assert!(
             d.req_per_s(8, 200, &slo, 1.0)
                 > DecodeCalibration::default().req_per_s(8, 200, &slo, 1.0)
