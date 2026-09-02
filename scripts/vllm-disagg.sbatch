@@ -48,7 +48,15 @@ echo "/work available: ${AVAIL_GB:-unknown} GiB"
 
 mapfile -t NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
 NODE_P="${NODES[0]}"; NODE_D="${NODES[1]:-${NODES[0]}}"
-echo "prefill node $NODE_P   decode node $NODE_D"
+# The proxy validates its --prefill/--decode entries as IP addresses and
+# rejects hostnames: "25a-hgpn008 does not appear to be an IPv4 or IPv6
+# address" (disagg_proxy_demo.py:389). It does that at argument-parse time,
+# after every worker has spent fourteen minutes loading the model, so job
+# 328752 cost a full allocation to learn it.
+IP_P=$(getent hosts "$NODE_P" | awk '{print $1; exit}')
+IP_D=$(getent hosts "$NODE_D" | awk '{print $1; exit}')
+echo "prefill node $NODE_P ($IP_P)   decode node $NODE_D ($IP_D)"
+[ -n "$IP_P" ] && [ -n "$IP_D" ] || { echo "!!! cannot resolve node names"; exit 30; }
 
 PIDS=()
 cleanup () {
@@ -82,8 +90,34 @@ serve () {   # tag node gpus role port sidechannel
   PIDS+=($!)
 }
 
+port_base=8100; side_base=9100
+
+echo; echo "########## proxy argument preflight ##########"
+# Run the proxy's own validator against the exact lists this job will pass, on
+# the login-side python, before a single GPU touches the model. It exits
+# non-zero on a bad host or port and costs nothing.
+PRE_P=""; PRE_D=""
+for i in $(seq 0 $((PREFILL_WORKERS-1))); do PRE_P="$PRE_P $IP_P:$((port_base+i))"; done
+for i in $(seq 0 $((DECODE_WORKERS-1))); do PRE_D="$PRE_D $IP_D:$((port_base+50+i))"; done
+( cd "$PIXI" && LD_LIBRARY_PATH="$ENVLIB" pixi run python - "$PRE_P" "$PRE_D" <<'PYEOF'
+import sys, ipaddress
+ok = True
+for group, arg in (("prefill", sys.argv[1]), ("decode", sys.argv[2])):
+    for inst in arg.split():
+        host, _, portstr = inst.rpartition(":")
+        try:
+            ipaddress.ip_address(host)
+            assert 0 < int(portstr) < 65536
+        except Exception as e:
+            print(f"  !!! {group} {inst}: {e}")
+            ok = False
+print("  proxy arguments valid" if ok else "  proxy arguments INVALID")
+raise SystemExit(0 if ok else 1)
+PYEOF
+) || { echo "!!! proxy would reject these arguments; not loading 220 GiB to find out"; exit 31; }
+
 echo; echo "########## workers ##########"
-port=8100; side=9100; g=0
+port=$port_base; side=$side_base; g=0
 for i in $(seq 0 $((PREFILL_WORKERS-1))); do
   serve "p$i" "$NODE_P" "$g,$((g+1))" producer $((port+i)) $((side+i))
   g=$((g+TP))
@@ -99,8 +133,8 @@ echo; echo "########## proxy ##########"
 # against disagg_proxy_demo.py:424-440 rather than assumed. A wrong flag name
 # here costs a whole 16-GPU allocation.
 PLIST=""; DLIST=""
-for i in $(seq 0 $((PREFILL_WORKERS-1))); do PLIST="$PLIST $NODE_P:$((port+i))"; done
-for i in $(seq 0 $((DECODE_WORKERS-1))); do DLIST="$DLIST $NODE_D:$((port+50+i))"; done
+for i in $(seq 0 $((PREFILL_WORKERS-1))); do PLIST="$PLIST $IP_P:$((port+i))"; done
+for i in $(seq 0 $((DECODE_WORKERS-1))); do DLIST="$DLIST $IP_D:$((port+50+i))"; done
 srun -N1 -n1 -w "$NODE_P" --overlap bash -lc "
   cd $PIXI && LD_LIBRARY_PATH=$ENVLIB pixi run python \
     /work/u5727520/vllm/examples/disaggregated/disaggregated_serving/disagg_proxy_demo.py \
