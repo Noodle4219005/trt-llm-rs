@@ -68,13 +68,13 @@ impl Remedy {
             vars.push_str(self.with);
         }
         // One line, because a wrapped command is a command someone will paste
-        // half of. 25a-hgpn143's NCCL hangs on its first collective, so the
-        // exclusion is not optional and belongs in the line rather than in a
-        // note beside it.
+        // half of. 25a-hgpn143 hangs on its first NCCL collective and
+        // 25a-hgpn175 has no apptainer at all, so the exclusion is not
+        // optional and belongs in the line rather than in a note beside it.
         format!(
             "{} {} {}",
             "sbatch -p 16gpus -N 2 --gres=gpu:H200:8 -t 00:15:00",
-            "--exclude=25a-hgpn142,25a-hgpn143",
+            "--exclude=25a-hgpn142,25a-hgpn143,25a-hgpn175",
             format_args!("--export=ALL,{vars} {script}")
         )
     }
