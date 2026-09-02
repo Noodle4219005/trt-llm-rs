@@ -554,6 +554,24 @@ write_engine_yaml () {
     if [ "${HOST_DISPATCH_SPIN}" = 1 ]; then
       echo "enable_low_latency_host_dispatch: true"
     fi
+    if [ "$role" = prefill ]; then
+      # Unconditional, and nothing to do with speculation.
+      #
+      # docs/source/features/disagg-serving.md: "Overlap scheduler for context
+      # servers are disabled because it's not supported for disaggregated
+      # context servers yet", and the official recipe writes
+      # disable_overlap_scheduler: True into context_config.yml.
+      #
+      # Every run in this project so far has left it on for prefill, including
+      # the 13.74 req/s baseline, so that number was measured in a
+      # configuration the documentation does not support. It is also the
+      # confound in the speculation comparison: enabling speculation turned
+      # this flag on for prefill at the same time, so the 13.74 -> 8.61 drop
+      # conflates removing an unsupported-but-apparently-beneficial overlap
+      # with adding the draft model.
+      echo "disable_overlap_scheduler: true"
+    fi
+
     # KV cache: dtype and block reuse. Both sides.
     echo "kv_cache_config:"
     echo "  dtype: ${KV_CACHE_DTYPE}"
@@ -594,18 +612,13 @@ write_engine_yaml () {
       # measured the overlap tax at +67% ITL, but on Qwen3-0.6B at a 3.19 ms
       # step, where the 2.15 ms of host overhead it hides is most of the step.
       # On a 235B model at 21.2 ms the same absolute overhead is about +10%.
-      # Overlap off on BOTH roles, as the reference does.
-      #
-      # I briefly moved this to decode only, reasoning that a prefill worker
-      # drafts nothing and so gains nothing from the flag. The source says
-      # otherwise: _util.py:661 and :664 both add tokens_per_gen_step - 1 to
-      # the per-sequence KV estimate, and :661 fires only when the overlap
-      # scheduler is ON. So leaving overlap on with speculation double-counts
-      # the draft tokens in the KV estimate -- +6 per sequence at draft 3
-      # instead of +3 -- which reserves more, allocates fewer blocks, and
-      # lowers concurrency. Job 326937 measured that: prefill throughput 3.05
-      # req/s against job 326855's 8.61 with the flag on both.
-      echo "disable_overlap_scheduler: true"
+      # Overlap off on the decode side under speculation, matching the
+      # reference. The prefill side has it off unconditionally -- see the
+      # role block below -- because the docs say so, not because of anything
+      # to do with speculation.
+      if [ "$role" = decode ]; then
+        echo "disable_overlap_scheduler: true"
+      fi
       echo "speculative_config:"
       echo "  decoding_type: Eagle3"
       echo "  speculative_model: ${SPEC_MODEL}"
