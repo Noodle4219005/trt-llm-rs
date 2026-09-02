@@ -293,21 +293,24 @@ impl Default for TopologyConfig {
     fn default() -> Self {
         Self {
             total_gpus: 16,
-            // 2 x TP4, because it was measured. The team swept 18
-            // configurations over 88 points and p2x4_d2x4 at N=80 returned
-            // goodput 12.42 against p4x2_d2x4's 9.54 at its own best N of 48
-            // (~/TODO_LLM_Wiki/problems/hpcai26-qwen/notes.md). This crate ran
-            // 4 x TP2 for a while on the strength of the capacity model
-            // preferring narrower workers -- fewer ranks in the all-reduce --
-            // and of a neighbouring vLLM stack using that shape. Neither is
-            // evidence against a direct end-to-end measurement of both shapes
-            // on this model and hardware, and the sweep was not consulted
-            // before the change. The measurement wins.
-            prefill_workers: 2,
-            // TP4. The fp8-KV finding stands -- TP2 *can* load, and the
-            // memory model was wrong to reject it -- but "can run" is not
-            // "runs best", and the sweep above measured both.
-            prefill_tp: 4,
+            // 4 x TP2, because it was measured ON THIS STACK.
+            //
+            // The team's 88-point sweep put p2x4_d2x4 ahead of p4x2_d2x4 and I
+            // switched to match it. That sweep is SGLang. Our own TRT-LLM runs
+            // say the opposite and say it twice: 4 x TP2 returned 13.70 and
+            // 13.74 req/s (jobs 326058, 326208) where 2 x TP4 returned 0.66
+            // (job 327422). It also agrees with our own per-GPU measurement of
+            // TP2 prefill at 1.45-2.0x TP4.
+            //
+            // This is the second time I have taken a measurement from another
+            // serving stack and applied it here without asking whether the
+            // mechanism transfers -- the first was recommending DEEPGEMM for an
+            // H200 on a vLLM result. A cross-stack number does not outrank a
+            // same-stack one.
+            prefill_workers: 4,
+            // TP2. 20.9 GiB per rank after the weight shard, which holds
+            // prefill's in-flight KV in fp8 and not in fp16.
+            prefill_tp: 2,
             decode_workers: 2,
             decode_tp: 4,
             gpu_gib: 131.0,
@@ -503,11 +506,11 @@ mod tests {
     /// "TP2 can load" is true and was worth establishing; it is not the same
     /// claim as "TP2 runs best", and the sweep answers the second directly.
     #[test]
-    fn default_config_is_valid_and_is_2p2d_on_tp4() {
+    fn default_config_is_valid_and_is_4p2d_on_narrow_prefill() {
         let c = Config::default();
         c.validate().expect("default config must validate");
-        assert_eq!(c.topology.prefill_workers, 2);
-        assert_eq!(c.topology.prefill_tp, 4);
+        assert_eq!(c.topology.prefill_workers, 4);
+        assert_eq!(c.topology.prefill_tp, 2);
         assert_eq!(c.topology.decode_workers, 2);
         assert_eq!(c.topology.decode_tp, 4);
         // N is the measured optimum for this topology, not the largest the

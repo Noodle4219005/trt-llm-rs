@@ -129,17 +129,33 @@ fn the_deployment_the_launcher_runs_is_one_the_model_would_recommend() {
         .into_iter()
         .next()
         .expect("the search found no topology at all");
-    assert_eq!(
-        (ptp, dtp),
-        (4, 4),
-        "the launcher must run the measured best, p2x4_d2x4"
-    );
+    // 4 x TP2 prefill: what THIS stack measured. The team's SGLang sweep
+    // prefers 2 x TP4 and we followed it once, which returned 0.66 req/s
+    // against 13.70 and 13.74 for 4 x TP2 on the same nodes. A cross-stack
+    // measurement does not outrank a same-stack one.
+    assert_eq!((ptp, dtp), (2, 4), "the launcher must run 4 x TP2 prefill");
+
+    // The model now prefers TP2 decode as well, and the launcher does not
+    // follow it there. Dropping the concurrency from 128 to 80 shrank the
+    // decode residency enough that TP2 fits -- 80/2 sequences at max_seq_len
+    // 4608 is 8.3 GiB of fp8 KV per rank against 20.9 free -- so the memory
+    // filter stopped excluding it and the narrow-worker preference took over.
+    //
+    // That preference has been right about prefill on this stack and is
+    // untested for decode, and the one decode width we have measured is TP8,
+    // which was bad for a reason specific to width: Qwen3-235B has four KV
+    // heads, so TP8 duplicates them. TP2 would not have that problem, but
+    // "would not have that problem" is not a measurement, and the last time I
+    // changed a topology on reasoning rather than a run it cost 196 SU and
+    // returned 0.66 req/s.
+    //
+    // So: assert what runs, and assert the disagreement is still open, so it
+    // is not quietly closed by tuning either side.
     assert_ne!(
         (best.prefill_tp, best.decode_tp),
         (ptp, dtp),
-        "the model now agrees with the measurement. If a missing term was found \
-         and modelled, delete this assertion and restore the equality. If the \
-         model was tuned until it agreed, undo that."
+        "the model now agrees about decode width. If TP2 decode was measured, \
+         update the launcher and restore the equality assertion."
     );
 }
 
