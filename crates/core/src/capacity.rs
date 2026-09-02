@@ -68,6 +68,21 @@ pub struct PrefillCalibration {
 /// -- a MoE backend question -- and not the collective, which is what a
 /// 25%-of-kernel-time all-reduce figure invites you to attack first.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+/// CAUTION: this decomposition's attribution is contradicted by a measurement.
+///
+/// It splits the gap to peak into duty cycle, all-reduce and "the remaining
+/// compute runs at N% MFU", and reports the compute term as the largest lever.
+/// A torch-trace profile of the same model on the same hardware
+/// (~/TODO_LLM_Wiki/problems/hpcai26-qwen/notes.md, 2026-08-23) found the MoE
+/// kernel running at 54% of H200 FP8 peak -- not slow -- with 25.2% of wall
+/// clock in NCCL AllReduce and an overlap of 11 ms out of 4957, i.e. none.
+/// That profile explicitly corrects the "prefill is at 16% of FLOP peak"
+/// reading as an artefact of charging the whole wall clock to compute.
+///
+/// So the compute-MFU term here is not a kernel-efficiency lever to be won by
+/// a better GEMM; it is mostly serialised communication wearing a compute
+/// label. Treat `largest_lever` as unverified until the decomposition is
+/// rebuilt against a trace.
 pub struct MfuBreakdown {
     pub overall: f64,
     /// Fraction of wall time actually spent issuing FLOPs.

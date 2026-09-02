@@ -106,7 +106,7 @@ set -uo pipefail
 #
 # If it fails, N=64 is the derived fallback: same configuration, +39% and +19%
 # margin, goodput 9.17 req/s.
-: "${N:=128}"
+: "${N:=80}"
 # The official AIPerf shape. Reported by the startup KV-pool check for context;
 # the check itself sizes against MAX_SEQ_LEN, because GUARANTEED_NO_EVICT
 # reserves that per admitted request rather than what the request will use.
@@ -160,8 +160,8 @@ fi
 # changes is the activation workspace, which is what made 0.70 OOM at two GPUs
 # per worker. PP2 x DP2 was the requested way to probe that and did not survive
 # NCCL init; see the PREFILL_PP note above.
-: "${PREFILL_WORKERS:=4}"
-: "${PREFILL_TP:=2}"
+: "${PREFILL_WORKERS:=2}"
+: "${PREFILL_TP:=4}"
 # PP2 x attention-DP over the same four GPUs was tried (316457) and never got as
 # far as allocating memory: NCCL communicator probe initialization timed out
 # after 60 s on all four ranks, in both workers, while the TP8 decode worker on

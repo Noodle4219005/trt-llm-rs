@@ -110,18 +110,36 @@ fn the_deployment_the_launcher_runs_is_one_the_model_would_recommend() {
         m.needed_gib_per_rank(dtp, Role::Decode)
     );
 
-    // And it should be on the shortlist, not merely feasible.
+    // The launcher follows the measurement, and the model disagrees with it.
+    //
+    // A sweep of 18 configurations over 88 points on this model and hardware
+    // (~/TODO_LLM_Wiki/problems/hpcai26-qwen/notes.md) put p2x4_d2x4 at N=80
+    // first with goodput 12.42, against p4x2_d2x4's 9.54 at its own best N.
+    // This model prefers narrower prefill workers, because
+    // tok_s_per_gpu_at_tp(2) exceeds tok_s_per_gpu_at_tp(4) -- fewer ranks in
+    // the all-reduce -- and that preference is not borne out end to end.
+    //
+    // The test asserts the launcher matches the measurement, and separately
+    // that the disagreement is still there, so nobody can quietly tune the
+    // model into agreement and call it a fix. Whatever the model is missing --
+    // most likely the cost of four prefill workers' KV handoffs against two --
+    // it is still missing it until someone finds and models the term.
     let best = m
         .search(c.topology.total_gpus, &[2, 4, 8], &[2, 4, 8])
         .into_iter()
         .next()
         .expect("the search found no topology at all");
     assert_eq!(
+        (ptp, dtp),
+        (4, 4),
+        "the launcher must run the measured best, p2x4_d2x4"
+    );
+    assert_ne!(
         (best.prefill_tp, best.decode_tp),
         (ptp, dtp),
-        "the model's best split is TP{}/TP{} and the launcher runs TP{ptp}/TP{dtp}",
-        best.prefill_tp,
-        best.decode_tp
+        "the model now agrees with the measurement. If a missing term was found \
+         and modelled, delete this assertion and restore the equality. If the \
+         model was tuned until it agreed, undo that."
     );
 }
 

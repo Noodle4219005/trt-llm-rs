@@ -248,8 +248,15 @@ impl Default for WorkloadConfig {
         Self {
             isl: 4000,
             osl: 200,
-            // 128, matching the 22.419 configuration. It was 80.
-            concurrency: 128,
+            // 80, the measured best for this topology. The sweep in
+            // ~/TODO_LLM_Wiki found the cliff between 48 and 56 for p4x2_d2x4
+            // (goodput 9.54 at ITL p90 19.21, collapsing to 5.68 at 20.29) and
+            // 80 as the optimum for p2x4_d2x4. goodput is a cliff function of
+            // ITL against the 20 ms gate, so the concurrency that maximises it
+            // is the largest one whose ITL p90 still clears 20 -- not the
+            // largest the pool can hold. Running 128 here put ITL at 21.2 and
+            // the pass rate near 3%.
+            concurrency: 80,
             max_num_tokens: 16384,
             max_seq_len: 4608,
             warmup_s: 60.0,
@@ -286,17 +293,21 @@ impl Default for TopologyConfig {
     fn default() -> Self {
         Self {
             total_gpus: 16,
-            // 4 x TP2. This was 2 x TP4 for as long as the memory model
-            // charged prefill for decode's residency and so rejected TP2;
-            // a neighbouring stack reached goodput 22.419 on 4 x TP2 prefill
-            // with fp8 KV, and the corrected model now picks the same shape.
-            prefill_workers: 4,
-            // 20.9 GiB per rank after the weight shard. That holds
-            // max_num_tokens of in-flight KV in fp8 and not in fp16, which is
-            // why our own three TP2 attempts died and the fp8 one elsewhere
-            // did not. Prefill hands its blocks to the decode worker; it is
-            // decode that needs a residency, and decode still runs TP4.
-            prefill_tp: 2,
+            // 2 x TP4, because it was measured. The team swept 18
+            // configurations over 88 points and p2x4_d2x4 at N=80 returned
+            // goodput 12.42 against p4x2_d2x4's 9.54 at its own best N of 48
+            // (~/TODO_LLM_Wiki/problems/hpcai26-qwen/notes.md). This crate ran
+            // 4 x TP2 for a while on the strength of the capacity model
+            // preferring narrower workers -- fewer ranks in the all-reduce --
+            // and of a neighbouring vLLM stack using that shape. Neither is
+            // evidence against a direct end-to-end measurement of both shapes
+            // on this model and hardware, and the sweep was not consulted
+            // before the change. The measurement wins.
+            prefill_workers: 2,
+            // TP4. The fp8-KV finding stands -- TP2 *can* load, and the
+            // memory model was wrong to reject it -- but "can run" is not
+            // "runs best", and the sweep above measured both.
+            prefill_tp: 4,
             decode_workers: 2,
             decode_tp: 4,
             gpu_gib: 131.0,
@@ -472,28 +483,37 @@ mod tests {
     use crate::capacity::Role;
 
     /// The default describes the deployment that runs, and it has now been
-    /// wrong in both directions.
+    /// wrong in three different directions.
     ///
-    /// It was 4P1D on TP2 prefill with a TP8 decode worker. Both halves were
-    /// refuted: one TP8 decode worker delivered 815 tok/s where two TP4 workers
-    /// reach 2,170-2,470 (Qwen3-235B has four KV heads, so TP4 gives each rank
-    /// one and TP8 must duplicate), and TP2 prefill died at three separate KV
-    /// fractions. So it became 2P2D on TP4.
+    /// It began as 4P1D on TP2 prefill with a TP8 decode worker. TP8 decode was
+    /// refuted by measurement -- 815 tok/s against 2,170-2,470 for two TP4
+    /// workers, because Qwen3-235B has four KV heads and TP8 must duplicate
+    /// them. TP2 prefill was refuted by three failed loads, so it became 2P2D
+    /// on TP4.
     ///
-    /// The TP2 half of that has now been refuted in turn. Every one of those
-    /// failures ran KV in fp16; a neighbouring stack reached goodput 22.419 on
-    /// 4 x TP2 prefill with fp8_e4m3, and the corrected memory model -- which
-    /// no longer charges prefill for decode's residency -- picks the same
-    /// shape. The decode half stands: decode still needs TP4.
+    /// Then the TP2 refutation was itself refuted: every one of those failures
+    /// ran KV in fp16, and 20.9 GiB per rank holds prefill's in-flight KV in
+    /// fp8. The memory model had also been charging prefill for decode's
+    /// residency. So it went to 4 x TP2, which the corrected model preferred
+    /// and a neighbouring vLLM stack used.
+    ///
+    /// And now back to 2 x TP4, because that is what was measured. A sweep of
+    /// 18 configurations over 88 points on this model and hardware put
+    /// p2x4_d2x4 at N=80 first with goodput 12.42, against p4x2_d2x4's 9.54.
+    /// "TP2 can load" is true and was worth establishing; it is not the same
+    /// claim as "TP2 runs best", and the sweep answers the second directly.
     #[test]
-    fn default_config_is_valid_and_is_4p2d_on_narrow_prefill() {
+    fn default_config_is_valid_and_is_2p2d_on_tp4() {
         let c = Config::default();
         c.validate().expect("default config must validate");
-        assert_eq!(c.topology.prefill_workers, 4);
-        assert_eq!(c.topology.prefill_tp, 2);
+        assert_eq!(c.topology.prefill_workers, 2);
+        assert_eq!(c.topology.prefill_tp, 4);
         assert_eq!(c.topology.decode_workers, 2);
         assert_eq!(c.topology.decode_tp, 4);
-        // Each role against its own requirement.
+        // N is the measured optimum for this topology, not the largest the
+        // pool can hold: goodput is a cliff function of ITL against the 20 ms
+        // gate.
+        assert_eq!(c.workload.concurrency, 80);
         let m = c.capacity_model();
         assert!(m.fits(c.topology.prefill_tp, Role::Prefill));
         assert!(m.fits(c.topology.decode_tp, Role::Decode));
