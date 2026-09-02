@@ -129,6 +129,31 @@ class ShadowState:
         self.stranded_tokens_short = 0
         self.reason_first_error = ""
 
+    @staticmethod
+    def project_steer(
+        ids: list,
+        is_context: list,
+        prev_seen_ms: dict,
+        now_ms: float,
+    ) -> list:
+        """(now - previous-token time) for each running request.
+
+        `prev_seen_ms` must be the timestamps as they were BEFORE this step
+        updated token_progress. Passing the post-update map -- where an
+        advancing request's time is already now_ms -- yields 0 for every
+        healthy request and collapses the p90 to 0, which is the defect that
+        left the ITL controller blind (observed_itl_ms 5.7e-256 against a real
+        21.2 ms) and unable to throttle decode concurrency.
+        """
+        out: list = []
+        for i, rid in enumerate(ids):
+            if is_context[i]:
+                continue
+            prev = prev_seen_ms.get(rid)
+            if prev is not None:
+                out.append(now_ms - prev)
+        return out
+
     def retire_departed(self, live_ids: set) -> None:
         """Book every request that stopped being offered, split by why.
 
@@ -388,6 +413,20 @@ def install() -> bool:
             itl_samples: list[float] = []
             generating = 0
             live_ids: set[int] = set()
+            # Each running request's timestamp as it enters this step, captured
+            # BEFORE the loop below overwrites it. The steer projection has to
+            # read these: an advancing request has its token_progress set to
+            # now_ms in this same loop, so `now_ms - token_progress[rid][0]` is
+            # zero for exactly the requests that are healthy. The p90 of a batch
+            # that is mostly advancing then collapses to 0, which is why
+            # observed_itl_ms read 5.7e-256 against a real 21.2 ms ITL and the
+            # controller never throttled -- the admission control vLLM and
+            # SGLang get from their own step accounting was silently disabled.
+            prev_seen_ms: dict[int, float] = {
+                rid: STATE.token_progress[rid][0]
+                for rid in ids
+                if rid in STATE.token_progress
+            }
             for i, rid in enumerate(ids):
                 live_ids.add(rid)
                 if is_context[i]:
@@ -460,13 +499,7 @@ def install() -> bool:
             # token was tried first and the simulator rejected it -- that
             # anchor precedes decode admission, so every freshly handed-off
             # request arrives carrying a latency decode concurrency cannot fix.
-            projected: list[float] = []
-            for i, rid in enumerate(ids):
-                if is_context[i]:
-                    continue
-                last = STATE.token_progress.get(rid)
-                if last is not None:
-                    projected.append(now_ms - last[0])
+            projected = STATE.project_steer(ids, is_context, prev_seen_ms, now_ms)
 
             if projected:
                 steer = _pct(projected, 0.90) or 0.0

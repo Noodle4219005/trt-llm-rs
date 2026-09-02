@@ -108,3 +108,46 @@ class DepartureLedgerTests(unittest.TestCase):
         state.token_progress[7] = (0.0, 3, 0)
         state.retire_departed(set())
         self.assertEqual((state.completed, state.stranded), (1, 0))
+
+
+class SteerSignalTests(unittest.TestCase):
+    """The controller steers on this. Job 326058 measured it at 5.7e-256 while
+    the real ITL was 21.2 ms, so the cap never came down and decode ran fully
+    oversubscribed -- the queueing the vLLM/SGLang admission model prevents."""
+
+    def test_an_advancing_batch_reports_the_step_time_not_zero(self):
+        # Two running requests, both last seen 21 ms ago -- a healthy step.
+        prev = {1: 100.0, 2: 100.0}
+        proj = shadow.ShadowState.project_steer(
+            ids=[1, 2], is_context=[False, False], prev_seen_ms=prev, now_ms=121.0
+        )
+        self.assertEqual(proj, [21.0, 21.0])
+        # The old bug: reading post-update timestamps (already now_ms) gave 0.
+        post = {1: 121.0, 2: 121.0}
+        broken = shadow.ShadowState.project_steer(
+            ids=[1, 2], is_context=[False, False], prev_seen_ms=post, now_ms=121.0
+        )
+        self.assertEqual(broken, [0.0, 0.0], "this is what the bug produced")
+
+    def test_a_stalled_request_dominates(self):
+        # One advancing (21 ms ago), one stalled (2 s ago).
+        prev = {1: 2100.0, 2: 100.0}
+        proj = shadow.ShadowState.project_steer(
+            ids=[1, 2], is_context=[False, False], prev_seen_ms=prev, now_ms=2121.0
+        )
+        self.assertEqual(sorted(proj), [21.0, 2021.0])
+
+    def test_context_requests_carry_no_itl(self):
+        prev = {1: 100.0}
+        proj = shadow.ShadowState.project_steer(
+            ids=[1, 2], is_context=[False, True], prev_seen_ms=prev, now_ms=121.0
+        )
+        self.assertEqual(proj, [21.0], "the context request has no ITL yet")
+
+    def test_a_first_sight_request_is_skipped(self):
+        # rid 2 has no prior timestamp -- it just arrived, no ITL to report.
+        prev = {1: 100.0}
+        proj = shadow.ShadowState.project_steer(
+            ids=[1, 2], is_context=[False, False], prev_seen_ms=prev, now_ms=121.0
+        )
+        self.assertEqual(proj, [21.0])
