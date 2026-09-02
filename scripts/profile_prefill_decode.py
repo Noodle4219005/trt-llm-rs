@@ -58,6 +58,8 @@ def main() -> None:
     )
     out = {"role": ROLE, "tp": TP, "chunk": CHUNK}
 
+    if ROLE == "stream":
+        _run_stream(llm, out)
     if ROLE == "mixed":
         _run_mixed(llm, out)
     if ROLE in ("prefill", "both"):
@@ -66,6 +68,74 @@ def main() -> None:
         _run_decode(llm, out)
     print("RESULT " + json.dumps(out), flush=True)
     llm.shutdown()
+
+
+def _run_stream(llm, out) -> None:
+    """Steady-state arrivals, which is the only condition under which chunked
+    prefill can show a benefit.
+
+    Job 328269 sent every request at t=0, so the run was prefill-heavy then
+    decode-heavy and chunking had no decode work to interleave into: it
+    measured chunking's cost (7-16% of throughput) and could not measure its
+    point. Here requests arrive at a fixed rate, so at any moment there is both
+    a prompt to process and sequences to advance -- and per-request TTFT and
+    ITL are recorded, which is what the gates are written in.
+    """
+    import asyncio
+
+    prompt = [1234] * ISL
+    greedy = SamplingParams(max_tokens=200, temperature=0.0, ignore_eos=True)
+    rate = float(os.environ.get("PROF_RATE", "2.0"))   # requests per second
+    total = int(os.environ.get("PROF_N", "48"))
+
+    async def one(i, results):
+        await asyncio.sleep(i / rate)
+        t0 = time.perf_counter()
+        first = None
+        n = 0
+        async for step in llm.generate_async(prompt, greedy, streaming=True):
+            if first is None:
+                first = time.perf_counter()
+            n = len(step.outputs[0].token_ids)
+        t1 = time.perf_counter()
+        if first is not None and n > 1:
+            results.append(
+                {
+                    "ttft_ms": (first - t0) * 1000.0,
+                    # AIPerf's quantity: (last - first) / (tokens - 1).
+                    "itl_ms": (t1 - first) * 1000.0 / (n - 1),
+                    "tokens": n,
+                }
+            )
+
+    async def drive():
+        results = []
+        t0 = time.perf_counter()
+        await asyncio.gather(*(one(i, results) for i in range(total)))
+        return results, time.perf_counter() - t0
+
+    results, wall = asyncio.run(drive())
+    if not results:
+        print("STREAM no results", flush=True)
+        return
+    ttft = sorted(r["ttft_ms"] for r in results)
+    itl = sorted(r["itl_ms"] for r in results)
+    p90 = lambda v: v[min(len(v) - 1, int(0.9 * len(v)))]
+    good = sum(1 for r in results if r["ttft_ms"] <= 3000.0 and r["itl_ms"] <= 20.0)
+    row = {
+        "chunk": CHUNK,
+        "offered_rate": rate,
+        "completed": len(results),
+        "wall_s": round(wall, 2),
+        "req_s": round(len(results) / wall, 3),
+        "ttft_p90_ms": round(p90(ttft), 1),
+        "itl_mean_ms": round(sum(itl) / len(itl), 2),
+        "itl_p90_ms": round(p90(itl), 2),
+        "good_frac": round(good / len(results), 3),
+        "goodput_at_16gpu": round(good / wall / TP * 16, 2),
+    }
+    out["stream"] = row
+    print("STREAM " + json.dumps(row), flush=True)
 
 
 def _run_mixed(llm, out) -> None:

@@ -16,8 +16,13 @@
 # concurrently rather than in series. A 2-GPU version of the same questions was
 # still loading at 30 minutes.
 #
-#   node A, GPUs 0-1   mixed TP2   in-card P/D: one worker doing both, which is
-#   node A, GPUs 2-5   mixed TP4   the only way to reach a fractional split.
+#   node A, GPUs 0-1   stream, no chunking
+#   node A, GPUs 2-3   stream, chunk 2048
+#
+# Steady-state arrivals with per-request TTFT and ITL, which is the only
+# condition under which chunked prefill can show a benefit and the only way to
+# turn a throughput number into a goodput one. Job 328269 sent everything at
+# t=0, so it measured chunking's cost (7-16%) and could not measure its point.
 #
 # The optimal prefill:decode allocation moves as prefill improves -- 10.9/5.1
 # GPUs at our measured 15.1% prefill MFU, 5.7/10.3 at the 59.3% a 38 req/s
@@ -73,6 +78,7 @@ launch () {                       # name node gpus tp role
     --env "CUDA_VISIBLE_DEVICES=$gpus" \
     --env "MODEL=$MODEL" --env "PYTHONPATH=$OUT" \
     --env "PROF_ROLE=$role" --env "PROF_TP=$tp" --env "PROF_CHUNK=$chunk" \
+    --env "PROF_RATE=${PROF_RATE:-1.8}" --env "PROF_N=${PROF_N:-40}" \
     --env "TLLM_PROFILE_START_STOP=6-10" \
     --env "TLLM_TORCH_PROFILE_TRACE=$OUT/$name-trace.json" \
     --env "TRTLLM_ENABLE_PDL=1" \
@@ -84,12 +90,12 @@ launch () {                       # name node gpus tp role
 }
 
 echo "=== launching three workers ==="
-PROF_CHUNK=1280 launch chunk1280 "$NODE_A" 0,1 2 mixed
-PROF_CHUNK=2560 launch chunk2560 "$NODE_A" 2,3 2 mixed
+PROF_CHUNK=0    launch stream-nochunk "$NODE_A" 0,1 2 stream
+PROF_CHUNK=2048 launch stream-chunk   "$NODE_A" 2,3 2 stream
 wait
 
 echo; echo "=== results ==="
-for n in chunk1280 chunk2560; do
+for n in stream-nochunk stream-chunk; do
   echo "--- $n ---"
   grep -E "^(PREFILL|DECODE|RESULT) " "$OUT/$n.log" 2>/dev/null | sed 's/^/  /' \
     || echo "  (no result; tail follows)"
