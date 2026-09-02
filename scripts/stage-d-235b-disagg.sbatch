@@ -594,24 +594,18 @@ write_engine_yaml () {
       # measured the overlap tax at +67% ITL, but on Qwen3-0.6B at a 3.19 ms
       # step, where the 2.15 ms of host overhead it hides is most of the step.
       # On a 235B model at 21.2 ms the same absolute overhead is about +10%.
-      # Overlap off on DECODE ONLY, not on both.
+      # Overlap off on BOTH roles, as the reference does.
       #
-      # The reference disables it on both, but its context server is TP1 with
-      # max_batch_size 32 -- a small one whose prefill throughput is not the
-      # constraint. Ours is. Job 326855 followed the reference exactly and
-      # prefill throughput fell from 13.7 to 8.61 req/s, which at N=128 put
-      # TTFT p90 at 11.4 s against a 3 s budget. The ITL gate passed for the
-      # first time, at 16.7 ms, and the run still scored 0.16 because the other
-      # gate broke.
-      #
-      # A prefill worker drafts nothing, so it gains nothing from the flag and
-      # pays the host-overhead cost. And disable_overlap_scheduler is a
-      # scheduler behaviour, not a KV layout: the cacheState match that
-      # requires an identical speculative_config on both sides
-      # (CacheFormatter::inquireSupport) does not extend to it.
-      if [ "$role" = decode ]; then
-        echo "disable_overlap_scheduler: true"
-      fi
+      # I briefly moved this to decode only, reasoning that a prefill worker
+      # drafts nothing and so gains nothing from the flag. The source says
+      # otherwise: _util.py:661 and :664 both add tokens_per_gen_step - 1 to
+      # the per-sequence KV estimate, and :661 fires only when the overlap
+      # scheduler is ON. So leaving overlap on with speculation double-counts
+      # the draft tokens in the KV estimate -- +6 per sequence at draft 3
+      # instead of +3 -- which reserves more, allocates fewer blocks, and
+      # lowers concurrency. Job 326937 measured that: prefill throughput 3.05
+      # req/s against job 326855's 8.61 with the flag on both.
+      echo "disable_overlap_scheduler: true"
       echo "speculative_config:"
       echo "  decoding_type: Eagle3"
       echo "  speculative_model: ${SPEC_MODEL}"
