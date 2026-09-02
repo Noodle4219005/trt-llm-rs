@@ -423,7 +423,10 @@ fi
 # whether TRT-LLM's Eagle3 path reproduces the ratio is what a run settles.
 : "${SPECULATION:=0}"
 : "${SPEC_MODEL:=/work/u4063814/hf_cache/eagle3/qwen3-235b-instruct-2507-specforge}"
-: "${SPEC_DRAFT_TOKENS:=1}"
+# 3, matching the reference config. Our own topk data is from SGLang, where
+# topk=1 beat topk=2 -- a different drafter and a different acceptance model,
+# so it does not carry over to TRT-LLM's one-model Eagle3.
+: "${SPEC_DRAFT_TOKENS:=3}"
 
 # ---------------------------------------------------------------------------
 # WHAT SM90 ALREADY DOES, AND THE ONE TRANSFER KNOB THAT IS STILL LIVE.
@@ -574,6 +577,24 @@ write_engine_yaml () {
       # in both its ctx and gen sections (examples/disaggregated/slurm/
       # benchmark/config.yaml:115 and :138). The prefill worker does not draft
       # anything; it needs the matching cache layout.
+      # Both of these come from NVIDIA's own disaggregated + Eagle3 perf test,
+      # tests/scripts/perf/disaggregated/gb200_stress-gpt-oss-120b-fp4_...
+      # _eagle3_ccb-NIXL.yaml, which is the only officially exercised
+      # combination of the two features. It sets an identical speculative_config
+      # on ctx and gen via a YAML anchor, and disable_overlap_scheduler on both.
+      #
+      # Job 326005 ran speculation with the overlap scheduler left on -- a shape
+      # that reference does not use -- and every request advanced for a while
+      # and then stopped without completing. Nothing forces the flag for Eagle3
+      # (llm_args.py:5424 forces it only for SaveHiddenStatesDecodingConfig, and
+      # _util.py:660 has KV accounting for overlap-with-speculation), so this is
+      # matching a known-good configuration rather than satisfying a validator.
+      #
+      # The cost is smaller here than the headline suggests. Job 312007
+      # measured the overlap tax at +67% ITL, but on Qwen3-0.6B at a 3.19 ms
+      # step, where the 2.15 ms of host overhead it hides is most of the step.
+      # On a 235B model at 21.2 ms the same absolute overhead is about +10%.
+      echo "disable_overlap_scheduler: true"
       echo "speculative_config:"
       echo "  decoding_type: Eagle3"
       echo "  speculative_model: ${SPEC_MODEL}"
