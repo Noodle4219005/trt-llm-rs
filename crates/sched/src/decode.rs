@@ -265,7 +265,30 @@ impl ItlController {
                 self.ewma_at_decrease = self.ewma_ms;
                 self.observations_since_decrease = 0;
             }
-            self.cap = (self.cap * self.decrease_factor).max(self.min_cap);
+            // Back off from what is actually running, not from the ceiling.
+            //
+            // The cap is initialised to max_batch_size, which TRT-LLM reports
+            // as 2048, while a decode worker at N=80 over two workers actually
+            // runs about 40 sequences. Multiplying 2048 by 0.9 changes nothing
+            // the engine can feel, so every probe window looks like "backing
+            // off did not help" and give_up latches long before the cap reaches
+            // the region where it would bind. Job 326208 measured exactly that:
+            // cap 2048, refused 0, concurrency_not_binding 1 -- a controller
+            // that concluded concurrency was not the lever without ever having
+            // pulled it.
+            //
+            // vLLM and SGLang do not have this failure because they bound the
+            // running batch directly against KV and a token budget rather than
+            // searching down from a ceiling. Clamping to the observed
+            // concurrency before the decrease gives the same property: the
+            // first backoff lands just under what is running and is felt
+            // immediately.
+            let binding = if concurrency > 0 {
+                self.cap.min(concurrency as f64)
+            } else {
+                self.cap
+            };
+            self.cap = (binding * self.decrease_factor).max(self.min_cap);
 
             // The floor, still over target. This is the decisive condition and
             // the improvement heuristic above does not catch it: while the cap
@@ -639,6 +662,40 @@ impl DecodeScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The backoff must bind on its first move, not walk down from a ceiling.
+    ///
+    /// TRT-LLM reports max_batch_size 2048 while a decode worker at N=80 over
+    /// two workers runs about 40 sequences. Job 326208 ended with cap 2048,
+    /// refused 0 and concurrency_not_binding 1: the controller decided
+    /// concurrency was not the lever without ever having limited anything.
+    #[test]
+    fn backing_off_lands_below_what_is_actually_running() {
+        let mut c = ItlController::new(20.0, 2048.0, 1.0, 2048.0);
+        // Eight observations to clear the warmup, all well over target at a
+        // real concurrency of 40.
+        for _ in 0..9 {
+            c.observe(30.0, 40);
+        }
+        assert!(
+            c.cap() < 40.0,
+            "cap {:.1} is still above the 40 sequences actually running, so the \
+             decrease cannot be felt",
+            c.cap()
+        );
+        assert!(c.cap() >= 1.0);
+    }
+
+    /// And it must not clamp upward: a cap already below the running count
+    /// stays where it is rather than jumping to the concurrency.
+    #[test]
+    fn backing_off_never_raises_the_cap() {
+        let mut c = ItlController::new(20.0, 10.0, 1.0, 2048.0);
+        for _ in 0..9 {
+            c.observe(30.0, 40);
+        }
+        assert!(c.cap() <= 10.0, "cap rose to {:.1}", c.cap());
+    }
 
     /// One appearance is not one token under speculation.
     ///

@@ -136,18 +136,29 @@ class ShadowState:
         progress: dict,
         now_ms: float,
     ) -> list:
-        """Each running request's mean ITL so far, projected to now.
+        """Time since each running request last produced a token.
 
-        This is AIPerf's own quantity: (last_token - first_token) / (tokens - 1),
-        with `now` standing in for the next token so a request that is currently
-        stalled raises the signal while it is stalled. `progress[rid]` is
-        (first_ms, last_ms, produced, wanted).
+        `progress[rid]` is (first_ms, last_ms, produced, wanted); this reads
+        last_ms, which only moves when the request actually advances. So an
+        advancing request contributes roughly one iteration and a stalled one
+        contributes a gap that grows while it is stalled -- responsive to the
+        current state, which is what an AIMD loop needs.
 
-        The earlier version measured now - last_advance, the instantaneous gap,
-        and read 17 ms while the true mean ITL was 26 (job 326091): on a call
-        where a request had just advanced, the gap was one iteration, not the
-        mean over its life. The controller saw 17 < 20, never throttled, and the
-        queueing this signal exists to control went unmanaged.
+        A lifetime mean, (now - first_ms) / (produced - 1), was tried instead
+        and reverted. It is the quantity AIPerf scores, but it is the wrong
+        input for a controller: after a hundred tokens a new interval carries a
+        hundredth of the weight, so the signal barely responds to a slowdown and
+        never recovers from a slow start. On clean nodes it also changed
+        nothing measurable -- job 326208 (mean) returned throughput 13.74 and
+        ITL 21.2 against job 326058's 13.70 and 21.2 with the signal broken
+        outright -- so it bought lag for no benefit.
+
+        Note an unresolved inconsistency in this instrumentation: advance_fraction
+        reads 0.976 and iteration_ms_ewma 15.4, which imply an ITL near 16 ms,
+        while advancing_itl_p50 reads 26 and AIPerf reports 21.2. Three of those
+        four cannot all be measuring what their names say. The mean-ITL change
+        above was made to close that gap and did not, so the gap is still open
+        and wants instrumentation rather than another guess.
         """
         out: list = []
         for i, rid in enumerate(ids):
@@ -156,9 +167,8 @@ class ShadowState:
             entry = progress.get(rid)
             if entry is None:
                 continue
-            first_ms, _last_ms, produced, _wanted = entry
-            if produced >= 2:
-                out.append((now_ms - first_ms) / (produced - 1))
+            _first_ms, last_ms, _produced, _wanted = entry
+            out.append(now_ms - last_ms)
         return out
 
     def retire_departed(self, live_ids: set) -> None:
