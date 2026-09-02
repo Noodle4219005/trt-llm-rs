@@ -4,9 +4,9 @@
 #SBATCH -p 8gpus
 #SBATCH -N 1
 #SBATCH --ntasks-per-node=1
-#SBATCH -c 72
+#SBATCH -c 48
 #SBATCH --mem=0
-#SBATCH --gres=gpu:H200:6
+#SBATCH --gres=gpu:H200:4
 #SBATCH -t 00:35:00
 #SBATCH -o /work/u5727520/trt-llm-rs-runs/logs/%x-%j.out
 #SBATCH -e /work/u5727520/trt-llm-rs-runs/logs/%x-%j.err
@@ -16,15 +16,18 @@
 # concurrently rather than in series. A 2-GPU version of the same questions was
 # still loading at 30 minutes.
 #
-#   node A, GPUs 0-1   decode  TP2   the 328143 decode trace put 46.12% of decode
-#                                    time in the TP4 all-reduce with a 28% gap;
-#                                    halving the ranks is the direct test, and it
-#                                    is what the capacity model has preferred
-#                                    while I dismissed it as untested
-#   node A, GPUs 2-5   prefill TP4   settles a live disagreement on OUR stack:
-#                                    our per-GPU numbers say TP2, the team's
-#                                    SGLang sweep says TP4, and cross-stack
-#                                    evidence has misled this project twice   the number nobody has: saturated decode
+#   node A, GPUs 0-1   mixed TP2   in-card P/D: one worker doing both, which is
+#   node A, GPUs 2-5   mixed TP4   the only way to reach a fractional split.
+#
+# The optimal prefill:decode allocation moves as prefill improves -- 10.9/5.1
+# GPUs at our measured 15.1% prefill MFU, 5.7/10.3 at the 59.3% a 38 req/s
+# target implies -- so a physical pool split must be re-cut whenever the kernels
+# change, while a shared card only changes a token-budget ratio. It also removes
+# the KV transfer: the cache is already where decode needs it.
+#
+# Pre-registered: per-request GPU-seconds at the measured rates are
+# 4000/6804 + 200/726 = 0.863, so sixteen perfectly packed GPUs give 18.53 req/s
+# and one TP2 replica of eight should give 2.32.   the number nobody has: saturated decode
 #                                    capacity. Every disaggregated run was
 #                                    prefill-bound so this side never reached
 #                                    its ceiling, and it is exactly what decides
@@ -65,27 +68,28 @@ cp "$SRC/scripts/usercustomize.py" "$SRC/scripts/trtllm_rs_mmap_weights.py" \
 # mapping, which was measured at +220.2 GiB of commit charge against +0.0.
 launch () {                       # name node gpus tp role
   local name=$1 node=$2 gpus=$3 tp=$4 role=$5
+  local chunk=${PROF_CHUNK:-0}
   srun -N1 -n1 -w "$node" --overlap apptainer exec --nv $BIND \
     --env "CUDA_VISIBLE_DEVICES=$gpus" \
     --env "MODEL=$MODEL" --env "PYTHONPATH=$OUT" \
-    --env "PROF_ROLE=$role" --env "PROF_TP=$tp" \
+    --env "PROF_ROLE=$role" --env "PROF_TP=$tp" --env "PROF_CHUNK=$chunk" \
     --env "TLLM_PROFILE_START_STOP=6-10" \
     --env "TLLM_TORCH_PROFILE_TRACE=$OUT/$name-trace.json" \
     --env "TRTLLM_ENABLE_PDL=1" \
     --env "TRTLLM_RS_MMAP_WEIGHTS=1" \
-    "$SIF" mpirun --bind-to none --oversubscribe -H "$node:72" -n 1 \
+    "$SIF" mpirun --bind-to none --oversubscribe -H "$node:48" -n 1 \
       python3 "$OUT/profile_prefill_decode.py" \
       > "$OUT/$name.log" 2>&1 &
   echo "  launched $name on $node gpus=$gpus tp=$tp role=$role"
 }
 
 echo "=== launching three workers ==="
-launch decode-tp2  "$NODE_A" 0,1     2 decode
-launch prefill-tp4 "$NODE_A" 2,3,4,5 4 prefill
+PROF_CHUNK=1280 launch chunk1280 "$NODE_A" 0,1 2 mixed
+PROF_CHUNK=2560 launch chunk2560 "$NODE_A" 2,3 2 mixed
 wait
 
 echo; echo "=== results ==="
-for n in decode-tp2 prefill-tp4; do
+for n in chunk1280 chunk2560; do
   echo "--- $n ---"
   grep -E "^(PREFILL|DECODE|RESULT) " "$OUT/$n.log" 2>/dev/null | sed 's/^/  /' \
     || echo "  (no result; tail follows)"

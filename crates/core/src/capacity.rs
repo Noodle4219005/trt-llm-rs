@@ -1050,3 +1050,74 @@ impl CapacityModel {
         }
     }
 }
+
+impl CapacityModel {
+    /// Requests per second if prefill and decode share every GPU instead of
+    /// owning separate pools.
+    ///
+    /// A disaggregated deployment is capped by whichever pool binds, and the
+    /// other pool's spare capacity is unreachable. Sharing the card removes
+    /// that boundary: the ceiling becomes total GPUs over the GPU-seconds one
+    /// request needs, `isl/prefill_rate + osl/decode_rate`.
+    ///
+    /// Measured against job 328269: at 6,804 prefill and 726 decode tok/s/GPU
+    /// this predicts 18.53 req/s on sixteen GPUs, and one TP2 replica reached
+    /// 17.45 at concurrency 24 without having saturated. Disaggregation on the
+    /// same hardware measures 13.74.
+    ///
+    /// It is a throughput ceiling and not a goodput one. In-card sharing puts
+    /// prefill work between a sequence's decode steps, so ITL is whatever the
+    /// interleaving leaves it -- job 328269 landed at 19.9 ms against a 20 ms
+    /// gate, with no margin.
+    pub fn in_card_pd_req_s(&self, gpus: u32, prefill_tok_s: f64, decode_tok_s: f64) -> f64 {
+        if prefill_tok_s <= 0.0 || decode_tok_s <= 0.0 {
+            return 0.0;
+        }
+        let per_request_gpu_s =
+            f64::from(self.isl) / prefill_tok_s + f64::from(self.osl) / decode_tok_s;
+        f64::from(gpus) / per_request_gpu_s
+    }
+
+    /// The prefill share of GPU time at the optimum, which moves as the kernels
+    /// change.
+    ///
+    /// This is the argument for in-card P/D rather than a physical split. At
+    /// our measured rates prefill wants 68% of the machine; at the 59.3%
+    /// prefill MFU a 38 req/s target implies it wants 36%. A pool boundary has
+    /// to be re-cut for each; a shared card only changes a token budget.
+    pub fn prefill_share(&self, prefill_tok_s: f64, decode_tok_s: f64) -> f64 {
+        let p = f64::from(self.isl) / prefill_tok_s.max(1e-9);
+        let d = f64::from(self.osl) / decode_tok_s.max(1e-9);
+        p / (p + d)
+    }
+}
+
+#[cfg(test)]
+mod in_card_tests {
+    use super::*;
+
+    /// Job 328269 predicted 18.53 and measured 17.45 still climbing.
+    #[test]
+    fn the_in_card_ceiling_matches_what_was_measured() {
+        let m = CapacityModel::default();
+        let r = m.in_card_pd_req_s(16, 6804.0, 726.0);
+        assert!((r - 18.53).abs() < 0.1, "{r}");
+        // And it must beat the disaggregated measurement it is compared to.
+        assert!(r > 13.74);
+    }
+
+    /// The optimum moves with prefill efficiency, which is the whole reason a
+    /// fractional split is worth having.
+    #[test]
+    fn the_optimal_split_moves_as_prefill_improves() {
+        let m = CapacityModel::default();
+        let now = m.prefill_share(6804.0, 726.0);
+        let target = m.prefill_share(26667.0, 726.0);
+        assert!((now - 0.681).abs() < 0.01, "measured rates: {now}");
+        assert!((target - 0.356).abs() < 0.01, "target rates: {target}");
+        assert!(
+            now > target,
+            "faster prefill must want a smaller share, not a larger one"
+        );
+    }
+}
