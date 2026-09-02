@@ -36,6 +36,9 @@ export PATH="$WORK/bin:$PATH"
 export SLURM_JOB_ID=999999
 export SLURM_JOB_NODELIST="node-[a-b]"
 export SLURM_SUBMIT_DIR="$PWD"
+# The disk preflight is a real environment check; this harness tests the
+# script's logic, so neutralise it rather than let a full quota fail the test.
+export MIN_FREE_GB=0
 
 # Stop before anything that needs a GPU: the first worker launch.
 STOP='########## NCCL preflight ##########'

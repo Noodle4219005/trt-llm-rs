@@ -692,6 +692,11 @@ cleanup () {
       || echo "  (verdict unavailable)"
   fi
 
+  # AIPerf's dataset is regenerable from --random-seed 2026 and is the single
+  # largest thing a run leaves behind. Deleting it here is what keeps the quota
+  # from filling silently over a sweep.
+  rm -f "$OUT/aiperf/inputs.json" 2>/dev/null
+
   echo; echo "########## teardown ##########"
   kill "${PIDS[@]}" 2>/dev/null; sleep 10
   srun -N2 -n2 --overlap bash -c 'pkill -f "dynamo.trtllm"; pkill -f "dynamo.frontend"' 2>/dev/null
@@ -977,6 +982,25 @@ echo; echo "########## what the model predicts for this run ##########"
 srun -N1 -n1 -w "$NODE_A" --overlap apptainer exec $BIND "$SIF" \
   "$STAGE/trt-llm-rs" plan --total-gpus "$(( PREFILL_WORKERS * PREFILL_TP + DECODE_WORKERS * DECODE_TP ))" \
   2>&1 | head -18 | sed 's/^/  /' || echo "  (planner unavailable; continuing)"
+
+echo; echo "########## disk preflight ##########"
+# Job 327547 died at 85% of the profiling phase with no error anyone could see:
+# exit 1, the batch script killed before aiperf returned, no export, no verdict.
+# The cause was the /work quota at 100% -- 99 GB of 100 -- and AIPerf's
+# generated inputs.json is about 200 MB a run. The team hit the same thing and
+# wrote down the same fix (delete per-point, regenerable from --random-seed).
+#
+# A run that dies for this reason costs a full allocation and leaves nothing to
+# read, so it is worth four lines to refuse up front.
+AVAIL_GB=$(df -BG --output=avail /work/u5727520 2>/dev/null | tail -1 | tr -dc '0-9')
+echo "  /work available: ${AVAIL_GB:-unknown} GiB"
+if [ -n "${AVAIL_GB:-}" ] && [ "$AVAIL_GB" -lt "${MIN_FREE_GB:-3}" ]; then
+  echo "!!! only ${AVAIL_GB} GiB free, need ${MIN_FREE_GB:-3}. AIPerf writes"
+  echo "!!! ~200 MB of inputs.json per run and the batch script is killed"
+  echo "!!! without a diagnosable error when the quota fills mid-profiling."
+  echo "!!! Reclaim: find /work/u5727520/trt-llm-rs-runs/out -name inputs.json -delete"
+  exit 29
+fi
 
 echo; echo "########## engine.yaml validation ##########"
 # Run WITHOUT srun. Job 325583 died here at exit 28 with "An error occurred in
